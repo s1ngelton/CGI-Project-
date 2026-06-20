@@ -1,0 +1,29 @@
+# Build
+build/
+
+# External libraries (each dev sets these up themselves)
+external/glad/
+external/imgui/
+external/stb/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj
+*.xcworkspace
+
+# Compiled objects
+*.o
+*.a
+*.dylib
+*.so
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
