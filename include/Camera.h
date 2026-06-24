@@ -51,7 +51,14 @@ public:
     void SetPose(glm::vec3 pos, glm::vec3 front) {
         Position = pos;
         Front    = glm::normalize(front);
-        updateVectors();
+        
+        // Recompute Yaw and Pitch from the new Front vector
+        Pitch = glm::degrees(asin(Front.y));
+        Yaw   = glm::degrees(atan2(Front.z, Front.x));
+        
+        // Recompute Right and Up based on new Front
+        Right = glm::normalize(glm::cross(Front, WorldUp));
+        Up    = glm::normalize(glm::cross(Right, Front));
     }
 
 private:

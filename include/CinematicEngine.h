@@ -3,8 +3,9 @@
 #include <vector>
 #include <string>
 #include "Camera.h"
+#include "Scene.h"
+#include "AudioManager.h"
 
-// A single keyframe: time + camera pose
 struct Keyframe {
     float     time;       // seconds from start
     glm::vec3 position;
@@ -16,26 +17,25 @@ class CinematicEngine {
 public:
     std::vector<Keyframe> keyframes;
     bool  loop     = false;
-    float duration = 0.0f;  // auto-computed from last keyframe
+    float duration = 45.0f;  // 45 seconds for 3 scenes
 
     void load(const std::string& jsonPath);
 
-    // Add a keyframe manually (useful for testing without a JSON file)
     void addKeyframe(float t, glm::vec3 pos, glm::vec3 target, float fov = 45.0f);
 
-    // Evaluate the spline at time t and write result into camera
-    void update(float t, Camera& camera);
+    // Update camera pose, animate scene objects, and trigger sound events
+    void update(float t, Camera& camera, Scene& scene, AudioManager& audio, float deltaTime);
 
-    // Reset playback
     void reset() { m_time = 0.0f; }
 
 private:
     float m_time = 0.0f;
+    float m_lastTime = 0.0f;
+    float m_walkingTime = 0.0f;
 
-    // Catmull-Rom spline interpolation between four control points
     static glm::vec3 catmullRom(glm::vec3 p0, glm::vec3 p1,
                                  glm::vec3 p2, glm::vec3 p3, float t);
 
-    // Find the segment index and local t for a given global time
     void findSegment(float time, int& i, float& localT) const;
+    void triggerEvent(float t, Camera& camera, Scene& scene, AudioManager& audio);
 };

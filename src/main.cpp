@@ -141,8 +141,20 @@ int main() {
         processMovement(window);
 
         // Cinematic camera overrides free camera when playing
+        static float cinematicTime = 0.0f;
         if (cinematicMode) {
-            cinematic.update(currentFrame, camera);
+            cinematicTime += deltaTime;
+            cinematic.update(cinematicTime, camera, scene, audio, deltaTime);
+            float t = cinematicTime;
+            renderer.settings.lightningActive = ((t >= 16.0f && t < 16.5f) || 
+                                                 (t >= 22.0f && t < 22.5f) || 
+                                                 (t >= 22.6f && t < 23.0f));
+            renderer.settings.roomLightOn = !((t >= 16.5f && t < 29.0f) || t >= 44.0f);
+        } else {
+            cinematicTime = 0.0f;
+            cinematic.reset();
+            renderer.settings.lightningActive = false;
+            renderer.settings.roomLightOn = true;
         }
 
         // Renderer settings driven by interactive toggles

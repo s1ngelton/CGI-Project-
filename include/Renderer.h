@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include "Shader.h"
 #include "Camera.h"
+#include <vector>
 
 // Forward declarations
 class Scene;
@@ -13,6 +14,8 @@ struct RenderSettings {
     bool ao         = true;   // SSAO
     bool dof        = true;   // Depth of field
     bool motionBlur = true;
+    bool lightningActive = false;
+    bool roomLightOn = true;
 };
 
 class Renderer {
@@ -50,6 +53,9 @@ private:
     unsigned int m_ssaoBlurFBO;
     unsigned int m_ssaoBlurColor;
 
+    std::vector<glm::vec3> m_ssaoKernel;
+    unsigned int m_ssaoNoiseTexture;
+
     // ── Shaders ─────────────────────────────────────────────────────────────
     Shader m_gBufferShader;
     Shader m_shadowShader;
@@ -66,6 +72,7 @@ private:
 
     // ── Previous frame data (motion blur) ───────────────────────────────────
     glm::mat4 m_prevViewProj = glm::mat4(1.0f);
+    float m_time = 0.0f;
 
     void initFramebuffers();
     void initShaders();
