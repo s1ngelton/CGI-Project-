@@ -1,6 +1,7 @@
 #pragma once
 #include <glad/glad.h>
 #include <glm/glm.hpp>
+#include <vector>
 #include "Shader.h"
 #include "Camera.h"
 
@@ -45,10 +46,12 @@ private:
     unsigned int m_pingpongFBO[2];    // for multi-pass post-process
     unsigned int m_pingpongColor[2];
 
-    unsigned int m_ssaoFBO;
-    unsigned int m_ssaoColor;
-    unsigned int m_ssaoBlurFBO;
-    unsigned int m_ssaoBlurColor;
+    unsigned int m_ssaoFBO        = 0;
+    unsigned int m_ssaoColor      = 0;
+    unsigned int m_ssaoBlurFBO    = 0;
+    unsigned int m_ssaoBlurColor  = 0;
+    unsigned int m_ssaoNoise      = 0;
+    std::vector<glm::vec3> m_ssaoKernel;
 
     // ── Shaders ─────────────────────────────────────────────────────────────
     Shader m_gBufferShader;
@@ -65,7 +68,10 @@ private:
     unsigned int m_quadVBO = 0;
 
     // ── Previous frame data (motion blur) ───────────────────────────────────
-    glm::mat4 m_prevViewProj = glm::mat4(1.0f);
+    glm::mat4 m_prevViewProj     = glm::mat4(1.0f);
+
+    // ── Shadow pass shared state ─────────────────────────────────────────────
+    glm::mat4 m_lightSpaceMatrix = glm::mat4(1.0f);
 
     void initFramebuffers();
     void initShaders();
@@ -75,6 +81,7 @@ private:
     void passShadow  (Scene& scene, const Camera& cam);
     void passGBuffer (Scene& scene, const Camera& cam);
     void passSSAO    (const Camera& cam);
+    void passSSAOBlur();
     void passLighting(Scene& scene, const Camera& cam);
     void passDOF     ();
     void passMotionBlur(const Camera& cam);
