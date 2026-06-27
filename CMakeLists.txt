@@ -76,7 +76,6 @@ set(ENGINE_SOURCES
     src/Scene.cpp
     src/CinematicEngine.cpp
     src/AudioManager.cpp
-    src/Primitives.cpp
 )
 
 add_executable(HorrorEngine ${ENGINE_SOURCES})
