@@ -27,3 +27,6 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+
+# Md docs that will be individually transfered to overleaf
+*.md
