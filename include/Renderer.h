@@ -92,6 +92,7 @@ private:
     Shader m_bloomBlurShader;
     Shader m_bloomCompositeShader;
     Shader m_reflectionShader;
+    Shader m_glassShader;
     Shader m_dofShader;
     Shader m_motionBlurShader;
     Shader m_tonemapShader;
@@ -123,6 +124,7 @@ private:
     void passBrightPass   ();
     void passBloomBlur    ();
     void passBloomComposite();
+    void passGlass     (Scene& scene, const Camera& cam);
     void passDOF       ();
     void passMotionBlur(const Camera& cam);
     void passTonemap ();

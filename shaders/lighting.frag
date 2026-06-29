@@ -12,10 +12,15 @@ uniform sampler2D ssaoTexture;
 uniform sampler2D shadowMap;
 uniform sampler2D reflectionTex;
 
-// ─── Light & camera ──────────────────────────────────────────────────────────
-uniform vec3  lightPos;
-uniform vec3  lightColor;
-uniform float lightIntensity;
+// ─── Ceiling light array ──────────────────────────────────────────────────────
+const int MAX_LIGHTS = 4;
+uniform int   numLights;
+uniform vec3  lightPositions[MAX_LIGHTS];
+uniform vec3  lightColors[MAX_LIGHTS];
+uniform float lightIntensities[MAX_LIGHTS];
+uniform float lightRadius;          // shared attenuation radius for all lights
+
+// ─── Camera & shadow ─────────────────────────────────────────────────────────
 uniform vec3  viewPos;
 uniform mat4  lightSpaceMatrix;
 
@@ -30,7 +35,7 @@ uniform bool  useShadows;
 uniform bool  useSoftShadows;
 uniform bool  useAO;
 
-// ─── Shadow: PCF (hard) ──────────────────────────────────────────────────────
+// ─── Shadow: wide PCF — 5×5 kernel, 2-texel step ────────────────────────────
 float shadowPCF(vec4 fragPosLightSpace, vec3 normal, vec3 lightDir) {
     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
     projCoords      = projCoords * 0.5 + 0.5;
@@ -40,12 +45,13 @@ float shadowPCF(vec4 fragPosLightSpace, vec3 normal, vec3 lightDir) {
     float shadow    = 0.0;
     vec2  texelSize = 1.0 / textureSize(shadowMap, 0);
 
-    for (int x = -1; x <= 1; ++x)
-    for (int y = -1; y <= 1; ++y) {
-        float pcfDepth = texture(shadowMap, projCoords.xy + vec2(x,y) * texelSize).r;
-        shadow += (projCoords.z - bias > pcfDepth) ? 1.0 : 0.0;
+    // 5×5, step = 2 texels → covers ±4-texel diameter (soft contact shadow)
+    for (int x = -2; x <= 2; ++x)
+    for (int y = -2; y <= 2; ++y) {
+        float d = texture(shadowMap, projCoords.xy + vec2(x,y) * texelSize * 2.0).r;
+        shadow += (projCoords.z - bias > d) ? 1.0 : 0.0;
     }
-    return shadow / 9.0;
+    return shadow / 25.0;
 }
 
 // ─── Shadow: PCSS (soft) ─────────────────────────────────────────────────────
@@ -73,7 +79,7 @@ float shadowPCSS(vec4 fragPosLightSpace, vec3 normal, vec3 lightDir) {
     float bias         = max(0.005 * (1.0 - dot(normal, lightDir)), 0.001);
     float receiverDepth = projCoords.z - bias;
 
-    float lightSize   = 0.05;
+    float lightSize   = 0.18;
     float blockerDist = findBlockerDistance(projCoords.xy, receiverDepth, lightSize);
     if (blockerDist < 0.0) return 0.0;
 
@@ -101,9 +107,9 @@ float D_GGX(float NdotH, float roughness) {
 }
 
 float G_SmithGGX(float NdotV, float NdotL, float roughness) {
-    float k   = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-    float gv  = NdotV / (NdotV * (1.0 - k) + k);
-    float gl  = NdotL / (NdotL * (1.0 - k) + k);
+    float k  = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    float gv = NdotV / (NdotV * (1.0 - k) + k);
+    float gl = NdotL / (NdotL * (1.0 - k) + k);
     return gv * gl;
 }
 
@@ -124,57 +130,63 @@ void main() {
     vec3  N        = normalize(normMet.rgb);
     float metallic = normMet.a;
 
-    vec4  albRough = texture(gAlbedoSpec, uv);
-    vec3  Albedo   = albRough.rgb;
+    vec4  albRough  = texture(gAlbedoSpec, uv);
+    vec3  Albedo    = albRough.rgb;
     float roughness = albRough.a;
 
-    // AO: combine SSAO with baked per-mesh AO map
+    // AO: SSAO from geometry × baked AO from texture
     float ssao_val = useAO ? texture(ssaoTexture, uv).r : 1.0;
     float ao       = ssao_val * baked_ao;
 
-    // Directions
-    vec3 V = normalize(viewPos  - FragPos);
-    vec3 L = normalize(lightPos - FragPos);
-    vec3 H = normalize(V + L);
-
-    float NdotL = max(dot(N, L), 0.0);
+    vec3 V   = normalize(viewPos - FragPos);
     float NdotV = max(dot(N, V), 0.0);
-    float NdotH = max(dot(N, H), 0.0);
-    float HdotV = max(dot(H, V), 0.0);
 
-    // Attenuation — smooth windowed falloff
-    float dist        = length(lightPos - FragPos);
-    const float LIGHT_RADIUS = 5.5;
-    float att2        = dist * dist / (LIGHT_RADIUS * LIGHT_RADIUS);
-    float attenuation = max(0.0, 1.0 - att2);
-    attenuation       = attenuation * attenuation;
-
-    // Shadow
-    float shadow = 0.0;
+    // Shadow — computed once from lightPositions[0] (the central shadow caster).
+    // Only gates light[0]'s contribution; lights 1-3 are unshadowed fill.
+    float shadow0 = 0.0;
     if (useShadows) {
+        vec3 shadowL           = normalize(lightPositions[0] - FragPos);
         vec4 fragPosLightSpace = lightSpaceMatrix * vec4(FragPos, 1.0);
-        shadow = useSoftShadows
-                 ? shadowPCSS(fragPosLightSpace, N, L)
-                 : shadowPCF (fragPosLightSpace, N, L);
+        shadow0 = useSoftShadows
+                  ? shadowPCSS(fragPosLightSpace, N, shadowL)
+                  : shadowPCF (fragPosLightSpace, N, shadowL);
     }
 
-    // PBR — metallic-roughness workflow
+    // PBR base reflectance
     vec3 F0 = mix(vec3(0.04), Albedo, metallic);
-    vec3 F  = F_Schlick(HdotV, F0);
 
-    float D = D_GGX(NdotH, roughness);
-    float G = G_SmithGGX(NdotV, NdotL, roughness);
+    // Accumulate contributions from all ceiling lights
+    vec3 Lo = vec3(0.0);
+    for (int i = 0; i < numLights; ++i) {
+        vec3  Li     = normalize(lightPositions[i] - FragPos);
+        vec3  Hi     = normalize(V + Li);
+        float NdotLi = max(dot(N, Li), 0.0);
+        float NdotHi = max(dot(N, Hi), 0.0);
+        float HdotVi = max(dot(Hi, V), 0.0);
 
-    vec3 specBRDF = D * G * F / max(4.0 * NdotV * NdotL, 0.001);
+        // Windowed quadratic attenuation
+        float dist_i = length(lightPositions[i] - FragPos);
+        float att2_i = dist_i * dist_i / (lightRadius * lightRadius);
+        float att_i  = max(0.0, 1.0 - att2_i);
+        att_i        = att_i * att_i;
 
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-    vec3 diffBRDF = kD * Albedo / PI;
+        vec3  Fi      = F_Schlick(HdotVi, F0);
+        float Di      = D_GGX(NdotHi, roughness);
+        float Gi      = G_SmithGGX(NdotV, NdotLi, roughness);
 
-    // Radiance from our single point light
-    vec3 radiance = lightColor * attenuation * lightIntensity;
+        vec3 specBRDF = Di * Gi * Fi / max(4.0 * NdotV * NdotLi, 0.001);
+        vec3 kDi      = (vec3(1.0) - Fi) * (1.0 - metallic);
+        vec3 diffBRDF = kDi * Albedo / PI;
 
-    // Direct illumination — shadow and AO both gate it
-    vec3 Lo = (diffBRDF + specBRDF) * radiance * NdotL * (1.0 - shadow) * ao;
+        vec3 radiance = lightColors[i] * att_i * lightIntensities[i];
+
+        // Shadow modulates only light[0]; lights 1-3 are unshadowed fill
+        float s = (i == 0) ? shadow0 : 0.0;
+        Lo += (diffBRDF + specBRDF) * radiance * NdotLi * (1.0 - s);
+    }
+
+    // AO gates the full direct illumination sum
+    Lo *= ao;
 
     // Emissive — additive, bypasses shadow/AO/BRDF, feeds bloom
     vec3 emissive = texture(gEmissive, uv).rgb;
@@ -204,7 +216,7 @@ void main() {
             float F0_refl  = 0.03;
             float fresnel  = F0_refl + (1.0 - F0_refl) * pow(1.0 - cosTheta, 5.0);
 
-            lighting += reflColor * fresnel * reflectivity * (1.0 - shadow);
+            lighting += reflColor * fresnel * reflectivity * (1.0 - shadow0);
         }
     }
 

@@ -6,9 +6,18 @@
 #include <random>
 #include <string>
 
-// Hardcoded light — shared between passShadow and passLighting.
-// Replace with Scene light list once multiple lights are needed.
-static const glm::vec3 kLightPos(0.0f, 2.8f, 0.0f);
+// Ceiling area light approximation: 4 point lights in a 2×2 grid at Y=2.9.
+// Shadow map is rendered from the central position; all 4 lights share it.
+static const glm::vec3 kLightColor(1.0f, 0.95f, 0.85f);   // warm white
+static constexpr float kLightIntensity = 5.0f;
+static constexpr float kLightRadius    = 8.0f;
+static const glm::vec3 kCeilLights[4] = {
+    { -1.5f, 2.9f,  1.0f },
+    {  1.5f, 2.9f,  1.0f },
+    { -1.5f, 2.9f, -1.0f },
+    {  1.5f, 2.9f, -1.0f },
+};
+static const glm::vec3 kShadowLightPos(0.0f, 2.9f, 0.0f);
 
 Renderer::Renderer(int width, int height)
     : m_width(width), m_height(height) {
@@ -29,6 +38,7 @@ Renderer::~Renderer() {
     glDeleteFramebuffers(2, m_pingpongFBO);
 
     glDeleteTextures(1, &m_hdrColor);
+    glDeleteRenderbuffers(1, &m_hdrDepth);
     glDeleteFramebuffers(1, &m_hdrFBO);
 
     glDeleteTextures(1, &m_shadowMap);
@@ -120,6 +130,12 @@ void Renderer::initFramebuffers() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_hdrColor, 0);
+
+    // Depth renderbuffer — needed so the forward glass pass can depth-test against opaque geo
+    glGenRenderbuffers(1, &m_hdrDepth);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_hdrDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, m_width, m_height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_hdrDepth);
 
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         std::cerr << "HDR framebuffer incomplete!\n";
@@ -249,6 +265,7 @@ void Renderer::initShaders() {
     m_bloomBlurShader      = Shader("shaders/lighting.vert", "shaders/bloom_blur.frag");
     m_bloomCompositeShader = Shader("shaders/lighting.vert", "shaders/bloom_composite.frag");
     m_reflectionShader     = Shader("shaders/reflection.vert", "shaders/reflection.frag");
+    m_glassShader          = Shader("shaders/glass.vert",       "shaders/glass.frag");
     m_tonemapShader        = Shader("shaders/lighting.vert", "shaders/tonemap.frag");
 }
 
@@ -314,9 +331,10 @@ void Renderer::renderQuad() {
 void Renderer::passShadow(Scene& scene, const Camera& cam) {
     // Orthographic projection: treats the point light as a directional
     // source for the purposes of a single shadow map.
-    // Up = (1,0,0) because kLightPos points straight down at origin.
+    // Orthographic shadow from the central ceiling position, looking straight down.
+    // Up = (1,0,0) because the view direction is -Y; any horizontal up vector works.
     glm::mat4 lightProj = glm::ortho(-5.0f, 5.0f, -5.0f, 5.0f, 0.1f, 20.0f);
-    glm::mat4 lightView = glm::lookAt(kLightPos,
+    glm::mat4 lightView = glm::lookAt(kShadowLightPos,
                                       glm::vec3(0.0f),
                                       glm::vec3(1.0f, 0.0f, 0.0f));
     m_lightSpaceMatrix  = lightProj * lightView;
@@ -438,9 +456,9 @@ void Renderer::passReflection(Scene& scene, const Camera& cam) {
     m_reflectionShader.use();
     m_reflectionShader.setMat4 ("view",         reflView);
     m_reflectionShader.setMat4 ("projection",   reflProj);
-    m_reflectionShader.setVec3 ("lightPos",     kLightPos);
-    m_reflectionShader.setVec3 ("lightColor",   glm::vec3(1.0f, 0.95f, 0.85f));
-    m_reflectionShader.setFloat("lightIntensity", 10.0f);
+    m_reflectionShader.setVec3 ("lightPos",       kShadowLightPos);
+    m_reflectionShader.setVec3 ("lightColor",     kLightColor);
+    m_reflectionShader.setFloat("lightIntensity", kLightIntensity);
 
     scene.drawForReflection(m_reflectionShader);
 
@@ -497,11 +515,15 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     m_lightingShader.setFloat("reflectivity",     settings.reflectivity);
     m_lightingShader.setFloat("glossyBlur",       settings.glossyBlur);
 
-    // Single point light — warm white, just under ceiling panel
-    m_lightingShader.setVec3 ("lightPos",       kLightPos);
-    m_lightingShader.setVec3 ("lightColor",     glm::vec3(1.0f, 0.95f, 0.85f));
-    m_lightingShader.setFloat("lightIntensity", 10.0f);
-    m_lightingShader.setVec3 ("viewPos",        cam.Position);
+    // 4-light ceiling array
+    for (int i = 0; i < 4; ++i) {
+        m_lightingShader.setVec3 ("lightPositions["  + std::to_string(i) + "]", kCeilLights[i]);
+        m_lightingShader.setVec3 ("lightColors["     + std::to_string(i) + "]", kLightColor);
+        m_lightingShader.setFloat("lightIntensities[" + std::to_string(i) + "]", kLightIntensity);
+    }
+    m_lightingShader.setInt  ("numLights",   4);
+    m_lightingShader.setFloat("lightRadius", kLightRadius);
+    m_lightingShader.setVec3 ("viewPos",     cam.Position);
 
     // Feature toggles
     m_lightingShader.setBool("useShadows",     settings.shadows);
@@ -594,6 +616,47 @@ void Renderer::passBloomComposite() {
     glEnable(GL_DEPTH_TEST);
 }
 
+void Renderer::passGlass(Scene& scene, const Camera& cam) {
+    if (scene.glassObjects.empty()) return;
+
+    // Copy opaque depth from the G-buffer into the HDR FBO's depth buffer so
+    // glass fragments depth-test against the fully-rendered opaque scene.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_gBuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_hdrFBO);
+    glBlitFramebuffer(0, 0, m_width, m_height, 0, 0, m_width, m_height,
+                      GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+
+    // Forward transparency into the HDR color buffer
+    glBindFramebuffer(GL_FRAMEBUFFER, m_hdrFBO);
+    glViewport(0, 0, m_width, m_height);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);   // glass doesn't write depth
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    m_glassShader.use();
+
+    glm::mat4 view = cam.GetViewMatrix();
+    glm::mat4 proj = glm::perspective(glm::radians(cam.Zoom),
+                                      (float)m_width / (float)m_height,
+                                      0.1f, 100.0f);
+    m_glassShader.setMat4 ("view",        view);
+    m_glassShader.setMat4 ("projection",  proj);
+    m_glassShader.setVec3 ("viewPos",     cam.Position);
+    m_glassShader.setFloat("glassOpacity", 0.12f);
+    m_glassShader.setVec3 ("glassColor",   glm::vec3(0.01f, 0.02f, 0.03f));
+    m_glassShader.setVec3 ("fresnelColor", glm::vec3(1.0f, 0.97f, 0.90f));
+
+    scene.drawGlassSorted(m_glassShader, cam.Position);
+
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_DEPTH_TEST);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 void Renderer::passDOF() {
     // TODO: post-process on HDR buffer
 }
@@ -652,6 +715,9 @@ void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
         passBloomComposite();
     }
 
+    // ── Forward transparency: glass panels ────────────────────────────────────
+    passGlass(scene, camera);
+
     // ── DOF / Motion blur go here once implemented ────────────────────────────
     // passDOF()
     // passMotionBlur(camera)
@@ -690,6 +756,8 @@ void Renderer::resize(int w, int h) {
     // HDR scene buffer
     glBindTexture(GL_TEXTURE_2D, m_hdrColor);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_hdrDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
 
     // SSAO buffers
     glBindTexture(GL_TEXTURE_2D, m_ssaoColor);

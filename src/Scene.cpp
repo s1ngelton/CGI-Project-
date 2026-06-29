@@ -1,15 +1,15 @@
 #include "Scene.h"
 #include <glm/gtc/matrix_transform.hpp>
+#include <algorithm>
 
 // ─── Procedural box builder ───────────────────────────────────────────────────
-// Generates a closed AABB mesh with per-face normals.  No UVs needed —
-// we use albedoColor / emissiveColor from the Mesh material fields instead.
 static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
                     glm::vec3 albedo,
-                    glm::vec3 emissive       = glm::vec3(0.0f),
-                    float     emissStrength  = 0.0f)
+                    glm::vec3 emissive      = glm::vec3(0.0f),
+                    float     emissStrength = 0.0f,
+                    float     roughness     = 0.5f,
+                    float     metallic      = 0.0f)
 {
-    // Each face: 4 verts CCW from outside, indices 0,1,2 + 0,2,3
     struct Face { glm::vec3 n; glm::vec3 v[4]; };
 
     float lx = lo.x, hx = hi.x;
@@ -45,83 +45,110 @@ static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
     Mesh m(std::move(verts), std::move(idx), 0, albedo);
     m.emissiveColor    = emissive;
     m.emissiveStrength = emissStrength;
+    m.roughness        = roughness;
+    m.metallic         = metallic;
     return m;
 }
 
-// Wrap a single procedural box in a SceneObject (identity transform).
 static SceneObject boxObj(glm::vec3 lo, glm::vec3 hi,
                           glm::vec3 albedo,
                           glm::vec3 emissive      = glm::vec3(0.0f),
-                          float     emissStrength = 0.0f)
+                          float     emissStrength = 0.0f,
+                          float     roughness     = 0.5f,
+                          float     metallic      = 0.0f)
 {
     SceneObject o;
-    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength));
+    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength, roughness, metallic));
+    return o;
+}
+
+// Build a glass panel SceneObject with its world-space sortCenter set.
+static SceneObject glassPanel(glm::vec3 lo, glm::vec3 hi) {
+    // Glass meshes have no diffuse/PBR maps — the glass shader handles shading itself.
+    SceneObject o;
+    o.model.addMesh(makeBox(lo, hi, glm::vec3(0.0f)));  // albedo unused by glass shader
+    o.sortCenter = (lo + hi) * 0.5f;
     return o;
 }
 
 // ─── Scene::load ─────────────────────────────────────────────────────────────
-// "Control" glowing glass-cube room.
+// "Control" glass-cube room with dark brushed-metal frame and glowing ceiling.
 // Right-handed, Y-up.  Room interior: X[-3,+3]  Z[-2,+2]  Y[0,3].
 // All frame bars: 0.08 × 0.08 m square, centred on room edges (half = 0.04 m).
 void Scene::load(const std::string& /*path*/) {
     const float H = 0.04f;   // half bar width
 
-    const glm::vec3 kFrameAlb  {0.70f, 0.70f, 0.70f};
-    const glm::vec3 kFrameEmit {0.85f, 0.92f, 1.00f};   // cool white
-    const float     kFrameStr  = 8.0f;
+    // Brushed dark metal — used for all structural frame elements
+    const glm::vec3 kFrameAlb  {0.06f, 0.06f, 0.07f};
+    const float     kFrameRough = 0.30f;
+    const float     kFrameMetal = 1.00f;
+    // No emissive — frame is dark, illuminated only by ceiling lights
 
-    const glm::vec3 kBotAlb    {0.20f, 0.20f, 0.20f};
-
-    const glm::vec3 kCeilEmit  {1.00f, 0.97f, 0.90f};   // warm white
+    const glm::vec3 kCeilEmit  {1.00f, 0.97f, 0.90f};   // warm white ceiling glow
 
     // ── 1. Plinth ─────────────────────────────────────────────────────────────
     objects.push_back(boxObj(
         {-3.4f, -0.7f, -2.4f}, {3.4f, 0.0f, 2.4f},
-        {0.06f, 0.06f, 0.07f}));
+        {0.06f, 0.06f, 0.07f},
+        glm::vec3(0.0f), 0.0f, 0.7f, 0.0f));  // rough, non-metallic concrete
 
-    // ── 2. Room floor (thin slab, optional emissive warm pool) ────────────────
+    // ── 2. Room floor (lit from above — no self-emission) ─────────────────────
     objects.push_back(boxObj(
         {-3.0f, 0.0f, -2.0f}, {3.0f, 0.005f, 2.0f},
         {0.15f, 0.10f, 0.08f},
-        {1.0f, 0.35f, 0.15f}, 0.4f));
-    objects.back().skipReflection = true;  // floor must not render into its own reflection
+        glm::vec3(0.0f), 0.0f, 0.6f, 0.0f));
+    objects.back().skipReflection = true;
 
     // ── 3. Vertical corner posts ──────────────────────────────────────────────
     const glm::vec2 corners[4] = {{-3,-2},{3,-2},{3,2},{-3,2}};
     for (auto c : corners)
         objects.push_back(boxObj(
             {c.x-H, 0.f, c.y-H}, {c.x+H, 3.f, c.y+H},
-            kFrameAlb, kFrameEmit, kFrameStr));
+            kFrameAlb, glm::vec3(0.0f), 0.0f, kFrameRough, kFrameMetal));
 
     // ── 4. Front mullions (X = -1.5, 0, +1.5  at Z = +2) ────────────────────
     for (float mx : {-1.5f, 0.0f, 1.5f})
         objects.push_back(boxObj(
             {mx-H, 0.f, 2.f-H}, {mx+H, 3.f, 2.f+H},
-            kFrameAlb, kFrameEmit, kFrameStr));
+            kFrameAlb, glm::vec3(0.0f), 0.0f, kFrameRough, kFrameMetal));
 
     // ── 5. Top frame  Y = 3: 4 perimeter bars + 2 cross-bars ─────────────────
-    // Front & back
-    objects.push_back(boxObj({-3.f,3.f-H, 2.f-H},{3.f,3.f+H, 2.f+H}, kFrameAlb,kFrameEmit,kFrameStr));
-    objects.push_back(boxObj({-3.f,3.f-H,-2.f-H},{3.f,3.f+H,-2.f+H}, kFrameAlb,kFrameEmit,kFrameStr));
-    // Left & right
-    objects.push_back(boxObj({-3.f-H,3.f-H,-2.f},{-3.f+H,3.f+H,2.f}, kFrameAlb,kFrameEmit,kFrameStr));
-    objects.push_back(boxObj({ 3.f-H,3.f-H,-2.f},{ 3.f+H,3.f+H,2.f}, kFrameAlb,kFrameEmit,kFrameStr));
-    // Cross-bar at Z=0 (spans X)
-    objects.push_back(boxObj({-3.f,3.f-H,-H},{3.f,3.f+H,H}, kFrameAlb,kFrameEmit,kFrameStr));
-    // Cross-bar at X=0 (spans Z)
-    objects.push_back(boxObj({-H,3.f-H,-2.f},{H,3.f+H,2.f}, kFrameAlb,kFrameEmit,kFrameStr));
+    objects.push_back(boxObj({-3.f,3.f-H, 2.f-H},{3.f,3.f+H, 2.f+H}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-3.f,3.f-H,-2.f-H},{3.f,3.f+H,-2.f+H}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-3.f-H,3.f-H,-2.f},{-3.f+H,3.f+H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({ 3.f-H,3.f-H,-2.f},{ 3.f+H,3.f+H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-3.f,3.f-H,-H},{3.f,3.f+H,H},           kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-H,3.f-H,-2.f},{H,3.f+H,2.f},            kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
 
-    // ── 6. Bottom frame  Y = 0: 4 perimeter bars, dark, no emissive ──────────
-    objects.push_back(boxObj({-3.f,-H, 2.f-H},{3.f,H, 2.f+H}, kBotAlb));
-    objects.push_back(boxObj({-3.f,-H,-2.f-H},{3.f,H,-2.f+H}, kBotAlb));
-    objects.push_back(boxObj({-3.f-H,-H,-2.f},{-3.f+H,H,2.f}, kBotAlb));
-    objects.push_back(boxObj({ 3.f-H,-H,-2.f},{ 3.f+H,H,2.f}, kBotAlb));
+    // ── 6. Bottom frame  Y = 0: 4 perimeter bars ─────────────────────────────
+    objects.push_back(boxObj({-3.f,-H, 2.f-H},{3.f,H, 2.f+H}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-3.f,-H,-2.f-H},{3.f,H,-2.f+H}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({-3.f-H,-H,-2.f},{-3.f+H,H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
+    objects.push_back(boxObj({ 3.f-H,-H,-2.f},{ 3.f+H,H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
 
     // ── 7. Ceiling light panel ────────────────────────────────────────────────
+    // emissiveStrength 5.0 → well above bloom threshold, strong warm-white glow
     objects.push_back(boxObj(
         {-2.7f, 2.93f, -1.7f}, {2.7f, 2.95f, 1.7f},
         {1.0f, 1.0f, 1.0f},
-        kCeilEmit, 10.0f));  // stronger than frame bars (8) → brightest thing in frame
+        kCeilEmit, 5.0f));
+
+    // ── 8. Glass panels (forward transparent pass, not in G-buffer) ───────────
+    // Panes are 2 mm thick, centred in the plane of each wall.
+    // Front wall (Z = +2): 4 bays between corner posts and mullions
+    glassObjects.push_back(glassPanel({-2.96f, H, 1.999f}, {-1.54f, 3.f-H, 2.001f}));
+    glassObjects.push_back(glassPanel({-1.46f, H, 1.999f}, {-0.04f, 3.f-H, 2.001f}));
+    glassObjects.push_back(glassPanel({ 0.04f, H, 1.999f}, { 1.46f, 3.f-H, 2.001f}));
+    glassObjects.push_back(glassPanel({ 1.54f, H, 1.999f}, { 2.96f, 3.f-H, 2.001f}));
+
+    // Back wall (Z = -2): one full-width pane
+    glassObjects.push_back(glassPanel({-2.96f, H, -2.001f}, {2.96f, 3.f-H, -1.999f}));
+
+    // Left wall (X = -3): one full-depth pane
+    glassObjects.push_back(glassPanel({-3.001f, H, -1.96f}, {-2.999f, 3.f-H, 1.96f}));
+
+    // Right wall (X = +3): one full-depth pane
+    glassObjects.push_back(glassPanel({ 2.999f, H, -1.96f}, { 3.001f, 3.f-H, 1.96f}));
 }
 
 // ─── Scene::draw ─────────────────────────────────────────────────────────────
@@ -133,11 +160,30 @@ void Scene::draw(Shader& shader) const {
 }
 
 // ─── Scene::drawForReflection ─────────────────────────────────────────────────
-// Same as draw() but skips objects flagged with skipReflection (i.e. the floor).
 void Scene::drawForReflection(Shader& shader) const {
     for (const SceneObject& obj : objects) {
         if (obj.skipReflection) continue;
         shader.setMat4("model", obj.transform);
         obj.model.draw(shader);
+    }
+}
+
+// ─── Scene::drawGlassSorted ───────────────────────────────────────────────────
+void Scene::drawGlassSorted(Shader& shader, const glm::vec3& camPos) const {
+    std::vector<const SceneObject*> sorted;
+    sorted.reserve(glassObjects.size());
+    for (const auto& obj : glassObjects)
+        sorted.push_back(&obj);
+
+    std::sort(sorted.begin(), sorted.end(),
+              [&](const SceneObject* a, const SceneObject* b) {
+                  float da = glm::length(a->sortCenter - camPos);
+                  float db = glm::length(b->sortCenter - camPos);
+                  return da > db;
+              });
+
+    for (const SceneObject* obj : sorted) {
+        shader.setMat4("model", obj->transform);
+        obj->model.draw(shader);
     }
 }
