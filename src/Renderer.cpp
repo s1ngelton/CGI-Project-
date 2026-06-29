@@ -40,6 +40,10 @@ Renderer::~Renderer() {
     glDeleteFramebuffers(1, &m_ssaoBlurFBO);
     glDeleteTextures(1, &m_ssaoNoise);
 
+    glDeleteTextures(1, &m_reflColor);
+    glDeleteRenderbuffers(1, &m_reflDepth);
+    glDeleteFramebuffers(1, &m_reflFBO);
+
     if (m_quadVAO) {
         glDeleteVertexArrays(1, &m_quadVAO);
         glDeleteBuffers(1, &m_quadVBO);
@@ -179,6 +183,34 @@ void Renderer::initFramebuffers() {
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    // ── Reflection FBO (half resolution, RGBA16F + depth) ────────────────────
+    {
+        int rw = m_width  / 2;
+        int rh = m_height / 2;
+
+        glGenFramebuffers(1, &m_reflFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_reflFBO);
+
+        glGenTextures(1, &m_reflColor);
+        glBindTexture(GL_TEXTURE_2D, m_reflColor);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, rw, rh, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_reflColor, 0);
+
+        glGenRenderbuffers(1, &m_reflDepth);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_reflDepth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, rw, rh);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_reflDepth);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            std::cerr << "Reflection framebuffer incomplete!\n";
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
     // ── Bloom ping-pong FBOs (half resolution) ────────────────────────────────
     // [0] = bright-pass output / blur source
     // [1] = blur destination (they swap each iteration in CP3)
@@ -216,6 +248,7 @@ void Renderer::initShaders() {
     m_brightPassShader     = Shader("shaders/lighting.vert", "shaders/bloom_bright.frag");
     m_bloomBlurShader      = Shader("shaders/lighting.vert", "shaders/bloom_blur.frag");
     m_bloomCompositeShader = Shader("shaders/lighting.vert", "shaders/bloom_composite.frag");
+    m_reflectionShader     = Shader("shaders/reflection.vert", "shaders/reflection.frag");
     m_tonemapShader        = Shader("shaders/lighting.vert", "shaders/tonemap.frag");
 }
 
@@ -376,6 +409,49 @@ void Renderer::passSSAOBlur() {
     glEnable(GL_DEPTH_TEST);
 }
 
+void Renderer::passReflection(Scene& scene, const Camera& cam) {
+    int rw = m_width  / 2;
+    int rh = m_height / 2;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_reflFBO);
+    glViewport(0, 0, rw, rh);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+
+    // Build reflected view: mirror camera position and front vector across Y=0
+    glm::vec3 reflPos   = cam.Position * glm::vec3(1.0f, -1.0f, 1.0f);
+    glm::vec3 reflFront = cam.Front    * glm::vec3(1.0f, -1.0f, 1.0f);
+    glm::mat4 reflView  = glm::lookAt(reflPos, reflPos + reflFront,
+                                      glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 reflProj  = glm::perspective(glm::radians(cam.Zoom),
+                                           (float)m_width / (float)m_height,
+                                           0.1f, 100.0f);
+    m_reflectionProjView = reflProj * reflView;
+
+    // Y-reflection inverts winding — flip to CW so backface culling stays correct
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CW);
+    glEnable(GL_CLIP_DISTANCE0);
+
+    m_reflectionShader.use();
+    m_reflectionShader.setMat4 ("view",         reflView);
+    m_reflectionShader.setMat4 ("projection",   reflProj);
+    m_reflectionShader.setVec3 ("lightPos",     kLightPos);
+    m_reflectionShader.setVec3 ("lightColor",   glm::vec3(1.0f, 0.95f, 0.85f));
+    m_reflectionShader.setFloat("lightIntensity", 10.0f);
+
+    scene.drawForReflection(m_reflectionShader);
+
+    glDisable(GL_CLIP_DISTANCE0);
+    glFrontFace(GL_CCW);
+    glDisable(GL_CULL_FACE);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);
+}
+
 void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glBindFramebuffer(GL_FRAMEBUFFER, m_hdrFBO);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -411,6 +487,15 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glActiveTexture(GL_TEXTURE5);
     glBindTexture(GL_TEXTURE_2D, m_gEmissive);
     m_lightingShader.setInt("gEmissive", 5);
+
+    // Planar floor reflection
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, m_reflColor);
+    m_lightingShader.setInt  ("reflectionTex",    6);
+    m_lightingShader.setBool ("reflectionEnable", settings.reflection);
+    m_lightingShader.setMat4 ("reflProjView",     m_reflectionProjView);
+    m_lightingShader.setFloat("reflectivity",     settings.reflectivity);
+    m_lightingShader.setFloat("glossyBlur",       settings.glossyBlur);
 
     // Single point light — warm white, just under ceiling panel
     m_lightingShader.setVec3 ("lightPos",       kLightPos);
@@ -531,6 +616,15 @@ void Renderer::passTonemap() {
     m_tonemapShader.setFloat("exposure",  settings.exposure);
     m_tonemapShader.setInt  ("tonemapOp", settings.tonemapOp);
 
+    // Color grade + vignette
+    m_tonemapShader.setBool ("gradeEnable",      settings.gradeEnable);
+    m_tonemapShader.setFloat("temperature",      settings.temperature);
+    m_tonemapShader.setVec3 ("gradeTint",        settings.gradeTint);
+    m_tonemapShader.setFloat("saturation",       settings.saturation);
+    m_tonemapShader.setVec3 ("shadowLift",       settings.shadowLift);
+    m_tonemapShader.setFloat("vignetteStrength", settings.vignetteStrength);
+    m_tonemapShader.setFloat("vignetteSoftness", settings.vignetteSoftness);
+
     renderQuad();
 
     glEnable(GL_DEPTH_TEST);
@@ -540,6 +634,8 @@ void Renderer::passTonemap() {
 
 void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
     passShadow  (scene, camera);
+    if (settings.reflection)
+        passReflection(scene, camera);
     passGBuffer (scene, camera);
 
     if (settings.ao) {
@@ -608,6 +704,12 @@ void Renderer::resize(int w, int h) {
         glBindTexture(GL_TEXTURE_2D, m_pingpongColor[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, halfW, halfH, 0, GL_RGBA, GL_FLOAT, nullptr);
     }
+
+    // Reflection buffer (half resolution)
+    glBindTexture(GL_TEXTURE_2D, m_reflColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, halfW, halfH, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_reflDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, halfW, halfH);
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindRenderbuffer(GL_RENDERBUFFER, 0);

@@ -23,6 +23,20 @@ struct RenderSettings {
     float bloomKnee       = 0.1f;
     int   bloomIterations = 5;    // H+V cycles; more = wider glow
     float bloomIntensity  = 0.04f; // used in composite (CP4)
+
+    // ── Color grade + vignette ──────────────────────────────────────────────
+    bool      gradeEnable      = false;
+    float     temperature      = 0.0f;
+    glm::vec3 gradeTint        = glm::vec3(1.0f);
+    float     saturation       = 1.0f;
+    glm::vec3 shadowLift       = glm::vec3(0.0f);
+    float     vignetteStrength = 0.0f;
+    float     vignetteSoftness = 0.45f;
+
+    // ── Planar floor reflection ──────────────────────────────────────────────
+    bool  reflection   = false;
+    float reflectivity = 0.25f;  // Fresnel scale
+    float glossyBlur   = 0.0f;   // blur radius in texels (0 = sharp)
 };
 
 class Renderer {
@@ -57,6 +71,10 @@ private:
     unsigned int m_pingpongFBO[2]   = {0, 0};  // bloom blur ping-pong (initialised in bloom checkpoint)
     unsigned int m_pingpongColor[2] = {0, 0};
 
+    unsigned int m_reflFBO   = 0;   // planar floor reflection (half-res, RGBA16F + depth)
+    unsigned int m_reflColor = 0;
+    unsigned int m_reflDepth = 0;   // depth renderbuffer
+
     unsigned int m_ssaoFBO        = 0;
     unsigned int m_ssaoColor      = 0;
     unsigned int m_ssaoBlurFBO    = 0;
@@ -73,6 +91,7 @@ private:
     Shader m_brightPassShader;
     Shader m_bloomBlurShader;
     Shader m_bloomCompositeShader;
+    Shader m_reflectionShader;
     Shader m_dofShader;
     Shader m_motionBlurShader;
     Shader m_tonemapShader;
@@ -87,12 +106,16 @@ private:
     // ── Shadow pass shared state ─────────────────────────────────────────────
     glm::mat4 m_lightSpaceMatrix = glm::mat4(1.0f);
 
+    // ── Reflection pass shared state ─────────────────────────────────────────
+    glm::mat4 m_reflectionProjView = glm::mat4(1.0f);
+
     void initFramebuffers();
     void initShaders();
     void initSSAOKernel();
     void renderQuad();
 
-    void passShadow  (Scene& scene, const Camera& cam);
+    void passShadow     (Scene& scene, const Camera& cam);
+    void passReflection (Scene& scene, const Camera& cam);
     void passGBuffer (Scene& scene, const Camera& cam);
     void passSSAO      (const Camera& cam);
     void passSSAOBlur  ();

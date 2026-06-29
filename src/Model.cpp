@@ -4,6 +4,7 @@
 #include "Model.h"
 #include <glad/glad.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
@@ -53,20 +54,61 @@ void Mesh::setupMesh() {
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex),
                           (void*)offsetof(Vertex, TexCoords));
+    // location 3 — tangent
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
+                          (void*)offsetof(Vertex, Tangent));
 
     glBindVertexArray(0);
 }
 
 void Mesh::draw(Shader& shader) const {
+    // Base color — unit 0
     if (diffuseTexID != 0) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, diffuseTexID);
-        shader.setInt("texture_diffuse1", 0);
+        shader.setInt ("texture_diffuse1", 0);
         shader.setBool("hasTexture", true);
     } else {
         shader.setBool("hasTexture", false);
         shader.setVec3("albedoColor", albedoColor);
     }
+
+    // Normal map — unit 1
+    shader.setBool("hasNormalTex", normalTexID != 0);
+    if (normalTexID) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, normalTexID);
+        shader.setInt("normalMap", 1);
+    }
+
+    // Roughness map — unit 2
+    shader.setBool("hasRoughnessTex", roughnessTexID != 0);
+    if (roughnessTexID) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, roughnessTexID);
+        shader.setInt("roughnessMap", 2);
+    }
+
+    // Metallic map — unit 3
+    shader.setBool("hasMetallicTex", metallicTexID != 0);
+    if (metallicTexID) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, metallicTexID);
+        shader.setInt("metallicMap", 3);
+    }
+
+    // AO map — unit 4
+    shader.setBool("hasAOTex", aoTexID != 0);
+    if (aoTexID) {
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, aoTexID);
+        shader.setInt("aoMap", 4);
+    }
+
+    // Material fallbacks when maps are absent
+    shader.setFloat("matRoughness", roughness);
+    shader.setFloat("matMetallic",  metallic);
 
     shader.setVec3 ("emissiveColor",    emissiveColor);
     shader.setFloat("emissiveStrength", emissiveStrength);
@@ -81,9 +123,12 @@ void Mesh::draw(Shader& shader) const {
 void Model::load(const std::string& path) {
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(path,
-        aiProcess_Triangulate |
-        aiProcess_FlipUVs     |
-        aiProcess_GenNormals);
+        aiProcess_Triangulate          |
+        aiProcess_FlipUVs              |
+        aiProcess_GenSmoothNormals     |
+        aiProcess_CalcTangentSpace     |   // required for normal mapping
+        aiProcess_JoinIdenticalVertices|
+        aiProcess_PreTransformVertices);
 
     if (!scene || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) || !scene->mRootNode) {
         std::cerr << "[Assimp] " << importer.GetErrorString() << "\n";
@@ -97,6 +142,32 @@ void Model::load(const std::string& path) {
 void Model::draw(Shader& shader) const {
     for (const Mesh& mesh : m_meshes)
         mesh.draw(shader);
+}
+
+std::pair<glm::vec3, glm::vec3> Model::computeAABB() const {
+    glm::vec3 mn( 1e30f), mx(-1e30f);
+    for (const Mesh& mesh : m_meshes)
+        for (const Vertex& v : mesh.vertices) {
+            mn = glm::min(mn, v.Position);
+            mx = glm::max(mx, v.Position);
+        }
+    return {mn, mx};
+}
+
+void Model::loadPBRMaps(const std::string& normalPath,
+                        const std::string& roughPath,
+                        const std::string& metalPath,
+                        const std::string& aoPath) {
+    unsigned int nid = normalPath.empty() ? 0 : loadTexture(normalPath);
+    unsigned int rid = roughPath.empty()  ? 0 : loadTexture(roughPath);
+    unsigned int mid = metalPath.empty()  ? 0 : loadTexture(metalPath);
+    unsigned int aid = aoPath.empty()     ? 0 : loadTexture(aoPath);
+    for (Mesh& m : m_meshes) {
+        if (nid) m.normalTexID    = nid;
+        if (rid) m.roughnessTexID = rid;
+        if (mid) m.metallicTexID  = mid;
+        if (aid) m.aoTexID        = aid;
+    }
 }
 
 void Model::processNode(aiNode* node, const aiScene* scene) {
@@ -122,6 +193,9 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
         v.TexCoords = mesh->mTextureCoords[0]
                       ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y)
                       : glm::vec2(0.0f);
+        v.Tangent   = mesh->mTangents
+                      ? glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
+                      : glm::vec3(1.0f, 0.0f, 0.0f);
         vertices.push_back(v);
     }
 
@@ -135,29 +209,44 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
     unsigned int diffuseTex = 0;
     glm::vec3    albedo(0.8f);
 
+    Mesh m(std::move(vertices), std::move(indices), diffuseTex, albedo);
+
     if (mesh->mMaterialIndex < scene->mNumMaterials) {
         aiMaterial* mat = scene->mMaterials[mesh->mMaterialIndex];
 
+        // Base color
         aiString texPath;
         if (mat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
-            std::string fullPath = m_directory + "/" + texPath.C_Str();
-            diffuseTex = loadTexture(fullPath);
+            diffuseTex = loadTexture(m_directory + "/" + texPath.C_Str());
+            m.diffuseTexID = diffuseTex;
         }
-
-        // No texture — read Kd from material as fallback colour
         if (diffuseTex == 0) {
             aiColor3D col(0.8f, 0.8f, 0.8f);
             mat->Get(AI_MATKEY_COLOR_DIFFUSE, col);
-            albedo = { col.r, col.g, col.b };
+            m.albedoColor = { col.r, col.g, col.b };
         }
-    }
 
-    Mesh m(std::move(vertices), std::move(indices), diffuseTex, albedo);
+        // PBR maps — try Assimp's typed queries; fall back to alternate type keys
+        auto tryTex = [&](aiTextureType type) -> unsigned int {
+            aiString p;
+            if (mat->GetTexture(type, 0, &p) == AI_SUCCESS)
+                return loadTexture(m_directory + "/" + p.C_Str());
+            return 0;
+        };
 
-    // Read emissive from material if present
-    if (mesh->mMaterialIndex < scene->mNumMaterials) {
-        aiMaterial* mat  = scene->mMaterials[mesh->mMaterialIndex];
-        aiColor3D   emit(0.0f, 0.0f, 0.0f);
+        m.normalTexID    = tryTex(aiTextureType_NORMALS);
+        if (!m.normalTexID) m.normalTexID = tryTex(aiTextureType_HEIGHT);
+
+        m.roughnessTexID = tryTex(aiTextureType_DIFFUSE_ROUGHNESS);
+        if (!m.roughnessTexID) m.roughnessTexID = tryTex(aiTextureType_SHININESS);
+
+        m.metallicTexID  = tryTex(aiTextureType_METALNESS);
+
+        m.aoTexID        = tryTex(aiTextureType_AMBIENT_OCCLUSION);
+        if (!m.aoTexID) m.aoTexID = tryTex(aiTextureType_LIGHTMAP);
+
+        // Emissive
+        aiColor3D emit(0.0f, 0.0f, 0.0f);
         mat->Get(AI_MATKEY_COLOR_EMISSIVE, emit);
         if (emit.r > 0.0f || emit.g > 0.0f || emit.b > 0.0f) {
             m.emissiveColor    = glm::vec3(emit.r, emit.g, emit.b);

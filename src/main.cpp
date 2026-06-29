@@ -52,6 +52,27 @@ float bloomKnee        = 0.5f;
 int   bloomIterations  = 5;
 float bloomIntensity   = 0.6f;
 
+// Color grade + vignette
+bool  gradeEnable      = false;
+float temperature      = 0.0f;
+float gradeTint[3]     = {1.0f, 1.0f, 1.0f};
+float saturation       = 1.0f;
+float shadowLift[3]    = {0.0f, 0.0f, 0.0f};
+float vignetteStrength = 0.0f;
+float vignetteSoftness = 0.45f;
+
+// Planar floor reflection
+bool  enableReflection  = false;
+float reflectivity      = 0.25f;
+float glossyBlur        = 0.0f;
+
+// Chair pose — live-adjust because free models have unpredictable scale/origin
+float chairPosX  =  0.3f;
+float chairPosY  =  0.0f;
+float chairPosZ  =  0.2f;
+float chairScale =  1.0f;
+float chairYaw   =  180.0f;  // default faces camera; dial with slider
+
 // ─── Callbacks ──────────────────────────────────────────────────────────────
 void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
     if (width == 0 || height == 0) return;   // minimized
@@ -85,7 +106,8 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
         case GLFW_KEY_5:      enableMotionBlur = !enableMotionBlur; break;
         case GLFW_KEY_SPACE:  cinematicMode    = !cinematicMode;    break;
         case GLFW_KEY_T:      globalTonemapOp  = 1 - globalTonemapOp; break;
-        case GLFW_KEY_6:      enableBloom      = !enableBloom;        break;
+        case GLFW_KEY_6:      enableBloom       = !enableBloom;        break;
+        case GLFW_KEY_7:      enableReflection  = !enableReflection;  break;
         case GLFW_KEY_TAB:
             uiMode = !uiMode;
             glfwSetInputMode(window, GLFW_CURSOR,
@@ -170,6 +192,34 @@ int main() {
     cinematic.load("assets/cameras.json"); // keyframe data for camera paths
     audio.load("assets/audio.json");       // sound cues
 
+    // ── Chair prop ─────────────────────────────────────────────────────────
+    // Drop your .obj (+ .mtl + textures) into assets/models/.
+    // The AABB printed below tells you the real size and where Y=0 sits
+    // relative to the model origin, so you can dial chairScale/chairYaw/chairPos.
+    SceneObject chairObj;
+    // Sofa.mtl is missing from the folder — Assimp loads geometry fine, falls
+    // back to albedo (0.8,0.8,0.8). Drop Sofa.mtl + textures here when available.
+    chairObj.model.load("assets/models/Sofa.obj");
+    chairObj.model.clearEmissive();
+    chairObj.model.loadPBRMaps(
+        "assets/models/Textures/Sofa_Normal.png",
+        "assets/models/Textures/Sofa_Roughness.png",
+        "assets/models/Textures/Sofa_Metallic.png",
+        "assets/models/Textures/Sofa_AO.png"
+    );
+
+    {
+        auto [mn, mx] = chairObj.model.computeAABB();
+        glm::vec3 sz  = mx - mn;
+        std::cout << "[Chair AABB]  min(" << mn.x << ", " << mn.y << ", " << mn.z << ")"
+                  << "  max(" << mx.x << ", " << mx.y << ", " << mx.z << ")\n"
+                  << "[Chair AABB]  " << sz.x << "w × " << sz.z << "d × " << sz.y
+                  << "h  |  model floor at Y=" << mn.y << "\n";
+    }
+
+    scene.objects.push_back(std::move(chairObj));
+    const int kChairIdx = (int)scene.objects.size() - 1;
+
     // ── Render loop ────────────────────────────────────────────────────────
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = static_cast<float>(glfwGetTime());
@@ -196,6 +246,29 @@ int main() {
         renderer.settings.bloomKnee       = bloomKnee;
         renderer.settings.bloomIterations = bloomIterations;
         renderer.settings.bloomIntensity  = bloomIntensity;
+
+        renderer.settings.gradeEnable      = gradeEnable;
+        renderer.settings.temperature      = temperature;
+        renderer.settings.gradeTint        = glm::vec3(gradeTint[0],    gradeTint[1],    gradeTint[2]);
+        renderer.settings.saturation       = saturation;
+        renderer.settings.shadowLift       = glm::vec3(shadowLift[0],   shadowLift[1],   shadowLift[2]);
+        renderer.settings.vignetteStrength = vignetteStrength;
+        renderer.settings.vignetteSoftness = vignetteSoftness;
+
+        renderer.settings.reflection   = enableReflection;
+        renderer.settings.reflectivity = reflectivity;
+        renderer.settings.glossyBlur   = glossyBlur;
+
+        // Rebuild chair transform from sliders each frame
+        {
+            glm::mat4 T = glm::translate(glm::mat4(1.0f),
+                                         glm::vec3(chairPosX, chairPosY, chairPosZ));
+            glm::mat4 R = glm::rotate(glm::mat4(1.0f),
+                                      glm::radians(chairYaw),
+                                      glm::vec3(0.0f, 1.0f, 0.0f));
+            glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(chairScale));
+            scene.objects[kChairIdx].transform = T * R * S;
+        }
 
         renderer.render(scene, camera, deltaTime);
 
@@ -228,6 +301,36 @@ int main() {
         ImGui::SliderFloat("Bloom knee",        &bloomKnee,       0.0f, 0.5f, "%.2f");
         ImGui::SliderInt  ("Bloom iterations",  &bloomIterations, 1,    10);
         ImGui::SliderFloat("Bloom intensity",   &bloomIntensity,  0.0f, 1.0f, "%.2f");
+        ImGui::Separator();
+        ImGui::Checkbox("Color grade",          &gradeEnable);
+        ImGui::SliderFloat("Temperature",       &temperature,      -1.0f, 1.0f, "%.2f");
+        ImGui::ColorEdit3 ("Tint",               gradeTint);
+        ImGui::SliderFloat("Saturation",        &saturation,        0.0f, 2.0f, "%.2f");
+        ImGui::ColorEdit3 ("Shadow lift",        shadowLift);
+        ImGui::SliderFloat("Vignette str",      &vignetteStrength,  0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Vignette soft",     &vignetteSoftness,  0.0f, 1.0f, "%.2f");
+        ImGui::Separator();
+        ImGui::Checkbox("[7] Floor reflection", &enableReflection);
+        ImGui::SliderFloat("Reflectivity",  &reflectivity,  0.0f, 1.0f,  "%.2f");
+        ImGui::SliderFloat("Glossy blur",   &glossyBlur,    0.0f, 5.0f,  "%.1f");
+        ImGui::Separator();
+        if (ImGui::Button("Control preset")) {
+            gradeEnable      = true;
+            temperature      = -0.1f;
+            gradeTint[0]     = 0.93f; gradeTint[1]  = 0.95f; gradeTint[2]  = 1.06f;
+            saturation       = 0.9f;
+            shadowLift[0]    = 0.02f; shadowLift[1] = 0.01f; shadowLift[2] = 0.04f;
+            vignetteStrength = 0.4f;
+            vignetteSoftness = 0.45f;
+        }
+        ImGui::Separator();
+        ImGui::Separator();
+        ImGui::Text("Chair pose  (AABB printed to console on load)");
+        ImGui::SliderFloat("Chair X",     &chairPosX,   -3.0f,  3.0f,   "%.2f");
+        ImGui::SliderFloat("Chair Y",     &chairPosY,   -0.5f,  0.5f,   "%.2f");
+        ImGui::SliderFloat("Chair Z",     &chairPosZ,   -2.0f,  2.0f,   "%.2f");
+        ImGui::SliderFloat("Chair scale", &chairScale,   0.01f,  5.0f,  "%.3f");
+        ImGui::SliderFloat("Chair yaw",   &chairYaw,  -180.0f, 180.0f,  "%.1f");
         ImGui::Separator();
         ImGui::Text("Cinematic: %s", cinematicMode ? "PLAYING" : "paused");
         ImGui::Text("%.1f FPS (%.2f ms)", 1.0f/deltaTime, deltaTime*1000.0f);

@@ -84,6 +84,7 @@ void Scene::load(const std::string& /*path*/) {
         {-3.0f, 0.0f, -2.0f}, {3.0f, 0.005f, 2.0f},
         {0.15f, 0.10f, 0.08f},
         {1.0f, 0.35f, 0.15f}, 0.4f));
+    objects.back().skipReflection = true;  // floor must not render into its own reflection
 
     // ── 3. Vertical corner posts ──────────────────────────────────────────────
     const glm::vec2 corners[4] = {{-3,-2},{3,-2},{3,2},{-3,2}};
@@ -126,6 +127,16 @@ void Scene::load(const std::string& /*path*/) {
 // ─── Scene::draw ─────────────────────────────────────────────────────────────
 void Scene::draw(Shader& shader) const {
     for (const SceneObject& obj : objects) {
+        shader.setMat4("model", obj.transform);
+        obj.model.draw(shader);
+    }
+}
+
+// ─── Scene::drawForReflection ─────────────────────────────────────────────────
+// Same as draw() but skips objects flagged with skipReflection (i.e. the floor).
+void Scene::drawForReflection(Shader& shader) const {
+    for (const SceneObject& obj : objects) {
+        if (obj.skipReflection) continue;
         shader.setMat4("model", obj.transform);
         obj.model.draw(shader);
     }

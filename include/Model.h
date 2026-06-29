@@ -15,6 +15,7 @@ struct Vertex {
     glm::vec3 Position;
     glm::vec3 Normal;
     glm::vec2 TexCoords;
+    glm::vec3 Tangent = glm::vec3(0.0f);
 };
 
 class Mesh {
@@ -22,6 +23,12 @@ public:
     std::vector<Vertex>       vertices;
     std::vector<unsigned int> indices;
     unsigned int              diffuseTexID     = 0;
+    unsigned int              normalTexID      = 0;
+    unsigned int              roughnessTexID   = 0;
+    unsigned int              metallicTexID    = 0;
+    unsigned int              aoTexID          = 0;
+    float                     roughness        = 0.5f;
+    float                     metallic         = 0.0f;
     glm::vec3                 albedoColor      = glm::vec3(0.8f);
     glm::vec3                 emissiveColor    = glm::vec3(0.0f);
     float                     emissiveStrength = 0.0f;
@@ -46,6 +53,20 @@ public:
     void load(const std::string& path);
     void draw(Shader& shader) const;
     void addMesh(Mesh m) { m_meshes.push_back(std::move(m)); }
+
+    void clearEmissive() {
+        for (Mesh& m : m_meshes) m.emissiveStrength = 0.0f;
+    }
+
+    // Returns {min, max} AABB in model-local space.
+    std::pair<glm::vec3, glm::vec3> computeAABB() const;
+
+    // Assign PBR maps explicitly (for models where the MTL doesn't reference them).
+    // Pass empty string to skip any individual map.
+    void loadPBRMaps(const std::string& normalPath,
+                     const std::string& roughPath,
+                     const std::string& metalPath,
+                     const std::string& aoPath);
 
 private:
     std::vector<Mesh>                    m_meshes;
