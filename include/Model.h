@@ -45,6 +45,7 @@ public:
 
     void load(const std::string& path);
     void draw(Shader& shader) const;
+    void addMesh(Mesh m) { m_meshes.push_back(std::move(m)); }
 
 private:
     std::vector<Mesh>                    m_meshes;

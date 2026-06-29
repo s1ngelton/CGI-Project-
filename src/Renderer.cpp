@@ -8,7 +8,7 @@
 
 // Hardcoded light — shared between passShadow and passLighting.
 // Replace with Scene light list once multiple lights are needed.
-static const glm::vec3 kLightPos(0.0f, 2.0f, 0.0f);
+static const glm::vec3 kLightPos(0.0f, 2.8f, 0.0f);
 
 Renderer::Renderer(int width, int height)
     : m_width(width), m_height(height) {
@@ -412,10 +412,11 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glBindTexture(GL_TEXTURE_2D, m_gEmissive);
     m_lightingShader.setInt("gEmissive", 5);
 
-    // Single hardcoded point light (white, overhead)
-    m_lightingShader.setVec3("lightPos",   kLightPos);
-    m_lightingShader.setVec3("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
-    m_lightingShader.setVec3("viewPos",    cam.Position);
+    // Single point light — warm white, just under ceiling panel
+    m_lightingShader.setVec3 ("lightPos",       kLightPos);
+    m_lightingShader.setVec3 ("lightColor",     glm::vec3(1.0f, 0.95f, 0.85f));
+    m_lightingShader.setFloat("lightIntensity", 10.0f);
+    m_lightingShader.setVec3 ("viewPos",        cam.Position);
 
     // Feature toggles
     m_lightingShader.setBool("useShadows",     settings.shadows);

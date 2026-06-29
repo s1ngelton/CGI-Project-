@@ -14,6 +14,7 @@ uniform sampler2D shadowMap;
 // ─── Light & camera ──────────────────────────────────────────────────────────
 uniform vec3  lightPos;
 uniform vec3  lightColor;
+uniform float lightIntensity;
 uniform vec3  viewPos;
 uniform mat4  lightSpaceMatrix;
 
@@ -101,18 +102,22 @@ void main() {
     vec3  viewDir    = normalize(viewPos  - FragPos);
     vec3  halfDir    = normalize(lightDir + viewDir);
     float dist       = length(lightPos - FragPos);
-    float attenuation = 1.0 / (1.0 + 0.09 * dist + 0.032 * dist * dist);
+    // Smooth windowed falloff: bright pool under ceiling, near-black at room corners
+    const float LIGHT_RADIUS = 5.5;
+    float att2        = dist * dist / (LIGHT_RADIUS * LIGHT_RADIUS);
+    float attenuation = max(0.0, 1.0 - att2);
+    attenuation       = attenuation * attenuation;
 
-    // Ambient (AO modulated)
-    vec3 ambient     = 0.15 * Albedo * ao;
+    // No ambient fill — point light is the only illuminator
+    vec3 ambient     = vec3(0.0);
 
     // Diffuse (Lambertian)
     float diff       = max(dot(Normal, lightDir), 0.0);
-    vec3  diffuse    = diff * lightColor * Albedo * attenuation;
+    vec3  diffuse    = diff * lightColor * Albedo * attenuation * lightIntensity;
 
     // Specular (Blinn-Phong)
     float spec       = pow(max(dot(Normal, halfDir), 0.0), 32.0) * Specular;
-    vec3  specular   = spec * lightColor * attenuation;
+    vec3  specular   = spec * lightColor * attenuation * lightIntensity;
 
     // Shadow
     float shadow     = 0.0;

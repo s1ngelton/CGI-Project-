@@ -25,7 +25,7 @@ constexpr int SCR_HEIGHT = 1080;
 const char*   TITLE      = "Horror Engine";
 
 // ─── Global state ───────────────────────────────────────────────────────────
-Camera camera(glm::vec3(0.0f, 1.0f, 3.0f));
+Camera camera(glm::vec3(0.0f, 1.35f, 9.5f));
 float  lastX      = SCR_WIDTH  / 2.0f;
 float  lastY      = SCR_HEIGHT / 2.0f;
 bool   firstMouse = true;
@@ -48,9 +48,9 @@ int   globalTonemapOp = 0;        // 0 = ACES, 1 = Reinhard
 // Bloom controls
 bool  enableBloom      = false;
 float bloomThreshold   = 1.0f;
-float bloomKnee        = 0.1f;
+float bloomKnee        = 0.5f;
 int   bloomIterations  = 5;
-float bloomIntensity   = 0.15f;
+float bloomIntensity   = 0.6f;
 
 // ─── Callbacks ──────────────────────────────────────────────────────────────
 void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
@@ -141,6 +141,12 @@ int main() {
     }
     std::cout << "OpenGL " << glGetString(GL_VERSION)
               << " | " << glGetString(GL_RENDERER) << "\n";
+
+    // "Control" room camera — 35 mm lens, straight-on, centered
+    camera.Yaw   = -90.0f;    // look in -Z toward room
+    camera.Pitch = -0.30f;    // look-at (0,1.30,0) from (0,1.35,9.5)
+    camera.Zoom  = 35.0f;
+    camera.ProcessMouseMovement(0.0f, 0.0f);   // commit Yaw/Pitch to Front vector
 
     glEnable(GL_DEPTH_TEST);
 
