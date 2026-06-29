@@ -7,6 +7,7 @@ in vec2 TexCoord;
 uniform sampler2D gPosition;
 uniform sampler2D gNormal;
 uniform sampler2D gAlbedoSpec;
+uniform sampler2D gEmissive;
 uniform sampler2D ssaoTexture;
 uniform sampler2D shadowMap;
 
@@ -122,6 +123,9 @@ void main() {
                  : shadowPCF (fragPosLightSpace, Normal, lightDir);
     }
 
-    vec3 lighting    = ambient + (1.0 - shadow) * (diffuse + specular);
+    // Emissive is additive and bypasses shadow / AO — it can exceed 1.0 to feed bloom
+    vec3 emissive    = texture(gEmissive, uv).rgb;
+
+    vec3 lighting    = ambient + (1.0 - shadow) * (diffuse + specular) + emissive;
     FragColor        = vec4(lighting, 1.0);
 }

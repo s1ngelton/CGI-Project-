@@ -68,6 +68,9 @@ void Mesh::draw(Shader& shader) const {
         shader.setVec3("albedoColor", albedoColor);
     }
 
+    shader.setVec3 ("emissiveColor",    emissiveColor);
+    shader.setFloat("emissiveStrength", emissiveStrength);
+
     glBindVertexArray(VAO);
     glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, nullptr);
     glBindVertexArray(0);
@@ -149,7 +152,20 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
         }
     }
 
-    return Mesh(std::move(vertices), std::move(indices), diffuseTex, albedo);
+    Mesh m(std::move(vertices), std::move(indices), diffuseTex, albedo);
+
+    // Read emissive from material if present
+    if (mesh->mMaterialIndex < scene->mNumMaterials) {
+        aiMaterial* mat  = scene->mMaterials[mesh->mMaterialIndex];
+        aiColor3D   emit(0.0f, 0.0f, 0.0f);
+        mat->Get(AI_MATKEY_COLOR_EMISSIVE, emit);
+        if (emit.r > 0.0f || emit.g > 0.0f || emit.b > 0.0f) {
+            m.emissiveColor    = glm::vec3(emit.r, emit.g, emit.b);
+            m.emissiveStrength = 1.0f;
+        }
+    }
+
+    return m;
 }
 
 unsigned int Model::loadTexture(const std::string& path) {

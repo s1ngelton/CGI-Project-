@@ -21,8 +21,12 @@ Renderer::~Renderer() {
     glDeleteTextures(1, &m_gPosition);
     glDeleteTextures(1, &m_gNormal);
     glDeleteTextures(1, &m_gAlbedo);
+    glDeleteTextures(1, &m_gEmissive);
     glDeleteRenderbuffers(1, &m_gDepth);
     glDeleteFramebuffers(1, &m_gBuffer);
+
+    glDeleteTextures(2, m_pingpongColor);
+    glDeleteFramebuffers(2, m_pingpongFBO);
 
     glDeleteTextures(1, &m_hdrColor);
     glDeleteFramebuffers(1, &m_hdrFBO);
@@ -72,10 +76,24 @@ void Renderer::initFramebuffers() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, m_gAlbedo, 0);
 
-    // The gbuffer frag also writes gVelocity at location 3; no attachment bound
-    // there yet — output is discarded until motion blur adds GL_COLOR_ATTACHMENT3.
-    GLenum drawBuffers[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
-    glDrawBuffers(3, drawBuffers);
+    // Emissive — RGB16F so values > 1.0 survive into bloom
+    glGenTextures(1, &m_gEmissive);
+    glBindTexture(GL_TEXTURE_2D, m_gEmissive);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, m_width, m_height, 0, GL_RGB, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT4, GL_TEXTURE_2D, m_gEmissive, 0);
+
+    // Slot 3 kept as GL_NONE: gbuffer frag writes gVelocity there but the
+    // attachment stays unbound until the motion blur pass is implemented.
+    GLenum drawBuffers[5] = {
+        GL_COLOR_ATTACHMENT0,  // gPosition
+        GL_COLOR_ATTACHMENT1,  // gNormal
+        GL_COLOR_ATTACHMENT2,  // gAlbedoSpec
+        GL_NONE,               // gVelocity (reserved for motion blur)
+        GL_COLOR_ATTACHMENT4,  // gEmissive
+    };
+    glDrawBuffers(5, drawBuffers);
 
     // Depth renderbuffer
     glGenRenderbuffers(1, &m_gDepth);
@@ -160,6 +178,31 @@ void Renderer::initFramebuffers() {
         std::cerr << "SSAO blur framebuffer incomplete!\n";
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // ── Bloom ping-pong FBOs (half resolution) ────────────────────────────────
+    // [0] = bright-pass output / blur source
+    // [1] = blur destination (they swap each iteration in CP3)
+    int halfW = m_width  / 2;
+    int halfH = m_height / 2;
+    for (int i = 0; i < 2; ++i) {
+        glGenFramebuffers(1, &m_pingpongFBO[i]);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_pingpongFBO[i]);
+
+        glGenTextures(1, &m_pingpongColor[i]);
+        glBindTexture(GL_TEXTURE_2D, m_pingpongColor[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, halfW, halfH, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, m_pingpongColor[i], 0);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            std::cerr << "Bloom ping-pong FBO " << i << " incomplete!\n";
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
 }
 
 // ── Shader init ──────────────────────────────────────────────────────────────
@@ -168,8 +211,12 @@ void Renderer::initShaders() {
     m_gBufferShader   = Shader("shaders/gbuffer.vert",  "shaders/gbuffer.frag");
     m_lightingShader  = Shader("shaders/lighting.vert", "shaders/lighting.frag");
     m_shadowShader    = Shader("shaders/shadow.vert",   "shaders/shadow.frag");
-    m_ssaoShader      = Shader("shaders/lighting.vert", "shaders/ssao.frag");
-    m_ssaoBlurShader  = Shader("shaders/lighting.vert", "shaders/ssao_blur.frag");
+    m_ssaoShader       = Shader("shaders/lighting.vert", "shaders/ssao.frag");
+    m_ssaoBlurShader   = Shader("shaders/lighting.vert", "shaders/ssao_blur.frag");
+    m_brightPassShader     = Shader("shaders/lighting.vert", "shaders/bloom_bright.frag");
+    m_bloomBlurShader      = Shader("shaders/lighting.vert", "shaders/bloom_blur.frag");
+    m_bloomCompositeShader = Shader("shaders/lighting.vert", "shaders/bloom_composite.frag");
+    m_tonemapShader        = Shader("shaders/lighting.vert", "shaders/tonemap.frag");
 }
 
 void Renderer::initSSAOKernel() {
@@ -360,6 +407,11 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glBindTexture(GL_TEXTURE_2D, m_ssaoBlurColor);
     m_lightingShader.setInt("ssaoTexture", 4);
 
+    // Emissive G-buffer attachment
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, m_gEmissive);
+    m_lightingShader.setInt("gEmissive", 5);
+
     // Single hardcoded point light (white, overhead)
     m_lightingShader.setVec3("lightPos",   kLightPos);
     m_lightingShader.setVec3("lightColor", glm::vec3(1.0f, 1.0f, 1.0f));
@@ -376,6 +428,86 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glEnable(GL_DEPTH_TEST);
 }
 
+void Renderer::passBrightPass() {
+    // Extract HDR pixels above threshold into ping-pong[0] at half resolution.
+    // passTonemap() restores the viewport to full-res afterwards.
+    glBindFramebuffer(GL_FRAMEBUFFER, m_pingpongFBO[0]);
+    glViewport(0, 0, m_width / 2, m_height / 2);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+
+    m_brightPassShader.use();
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_hdrColor);
+    m_brightPassShader.setInt  ("hdrBuffer", 0);
+    m_brightPassShader.setFloat("threshold", settings.bloomThreshold);
+    m_brightPassShader.setFloat("knee",      settings.bloomKnee);
+
+    renderQuad();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glEnable(GL_DEPTH_TEST);
+    // Viewport intentionally left at half-res; passBloomBlur runs at the same res.
+}
+
+void Renderer::passBloomBlur() {
+    // Ping-pong separable Gaussian blur at half resolution.
+    // Each iteration: H-pass [0]→[1], V-pass [1]→[0].
+    // After N iterations the blurred result lives in m_pingpongColor[0].
+    // passTonemap() restores the full-res viewport; passBloomComposite (CP4)
+    // must set it to full-res too before writing back to m_hdrFBO.
+
+    glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, m_width / 2, m_height / 2);
+
+    m_bloomBlurShader.use();
+    m_bloomBlurShader.setInt("image", 0);
+    glActiveTexture(GL_TEXTURE0);
+
+    for (int i = 0; i < settings.bloomIterations; ++i) {
+        // Horizontal: read from [0], write to [1]
+        glBindFramebuffer(GL_FRAMEBUFFER, m_pingpongFBO[1]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        m_bloomBlurShader.setBool("horizontal", true);
+        glBindTexture(GL_TEXTURE_2D, m_pingpongColor[0]);
+        renderQuad();
+
+        // Vertical: read from [1], write to [0]
+        glBindFramebuffer(GL_FRAMEBUFFER, m_pingpongFBO[0]);
+        glClear(GL_COLOR_BUFFER_BIT);
+        m_bloomBlurShader.setBool("horizontal", false);
+        glBindTexture(GL_TEXTURE_2D, m_pingpongColor[1]);
+        renderQuad();
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glEnable(GL_DEPTH_TEST);
+}
+
+void Renderer::passBloomComposite() {
+    // Additively blend blurred bloom (m_pingpongColor[0]) back into m_hdrFBO.
+    // GL_ONE + GL_ONE means: hdr_dst = hdr_dst + bloom_src.  No read-write
+    // hazard because we write to m_hdrFBO while sampling m_pingpongColor[0].
+    glBindFramebuffer(GL_FRAMEBUFFER, m_hdrFBO);
+    glViewport(0, 0, m_width, m_height);
+    glDisable(GL_DEPTH_TEST);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+
+    m_bloomCompositeShader.use();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_pingpongColor[0]);
+    m_bloomCompositeShader.setInt  ("bloomBlur",      0);
+    m_bloomCompositeShader.setFloat("bloomIntensity", settings.bloomIntensity);
+    renderQuad();
+
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glEnable(GL_DEPTH_TEST);
+}
+
 void Renderer::passDOF() {
     // TODO: post-process on HDR buffer
 }
@@ -385,7 +517,22 @@ void Renderer::passMotionBlur(const Camera& cam) {
 }
 
 void Renderer::passTonemap() {
-    // TODO: HDR -> LDR final output
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);   // bloom passes may leave a half-res viewport
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_DEPTH_TEST);
+
+    m_tonemapShader.use();
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_hdrColor);
+    m_tonemapShader.setInt  ("hdrBuffer", 0);
+    m_tonemapShader.setFloat("exposure",  settings.exposure);
+    m_tonemapShader.setInt  ("tonemapOp", settings.tonemapOp);
+
+    renderQuad();
+
+    glEnable(GL_DEPTH_TEST);
 }
 
 // ── Top-level render ──────────────────────────────────────────────────────────
@@ -401,14 +548,18 @@ void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
 
     passLighting(scene, camera);
 
-    // Blit HDR buffer to screen — values > 1.0 clamp until passTonemap is added
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_hdrFBO);
-    glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glBlitFramebuffer(0, 0, m_width, m_height,
-                      0, 0, m_width, m_height,
-                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // ── Bloom chain ───────────────────────────────────────────────────────────
+    if (settings.bloom) {
+        passBrightPass();
+        passBloomBlur();
+        passBloomComposite();
+    }
+
+    // ── DOF / Motion blur go here once implemented ────────────────────────────
+    // passDOF()
+    // passMotionBlur(camera)
+
+    passTonemap();
 
     // m_prevViewProj updated at end of frame — must stay after motion blur pass
     glm::mat4 view = camera.GetViewMatrix();
@@ -416,4 +567,47 @@ void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
                                       (float)m_width / (float)m_height,
                                       0.1f, 100.0f);
     m_prevViewProj = proj * view;
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+// Call whenever the window framebuffer dimensions change (GLFW callback).
+// Re-uploads storage for every screen-sized texture/renderbuffer in-place;
+// FBO attachments don't need to be re-bound because they reference the object.
+void Renderer::resize(int w, int h) {
+    if (w == 0 || h == 0) return;   // minimized — skip to avoid 0×0 FBOs
+    m_width  = w;
+    m_height = h;
+
+    // G-Buffer
+    glBindTexture(GL_TEXTURE_2D, m_gPosition);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, m_gNormal);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, m_gAlbedo);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D, m_gEmissive);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0, GL_RGB, GL_FLOAT, nullptr);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_gDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+
+    // HDR scene buffer
+    glBindTexture(GL_TEXTURE_2D, m_hdrColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, nullptr);
+
+    // SSAO buffers
+    glBindTexture(GL_TEXTURE_2D, m_ssaoColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, w, h, 0, GL_RED, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, m_ssaoBlurColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, w, h, 0, GL_RED, GL_FLOAT, nullptr);
+
+    // Bloom ping-pong buffers (half resolution)
+    int halfW = w / 2;
+    int halfH = h / 2;
+    for (int i = 0; i < 2; ++i) {
+        glBindTexture(GL_TEXTURE_2D, m_pingpongColor[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, halfW, halfH, 0, GL_RGBA, GL_FLOAT, nullptr);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
 }

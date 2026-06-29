@@ -21,8 +21,10 @@ class Mesh {
 public:
     std::vector<Vertex>       vertices;
     std::vector<unsigned int> indices;
-    unsigned int              diffuseTexID = 0;
-    glm::vec3                 albedoColor  = glm::vec3(0.8f);
+    unsigned int              diffuseTexID     = 0;
+    glm::vec3                 albedoColor      = glm::vec3(0.8f);
+    glm::vec3                 emissiveColor    = glm::vec3(0.0f);
+    float                     emissiveStrength = 0.0f;
 
     Mesh(std::vector<Vertex>       verts,
          std::vector<unsigned int> indices,

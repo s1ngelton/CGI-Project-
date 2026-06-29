@@ -9,11 +9,20 @@
 class Scene;
 
 struct RenderSettings {
-    bool shadows    = true;
-    bool softShadow = true;   // PCSS
-    bool ao         = true;   // SSAO
-    bool dof        = true;   // Depth of field
-    bool motionBlur = true;
+    bool  shadows    = true;
+    bool  softShadow = true;   // PCSS
+    bool  ao         = true;   // SSAO
+    bool  dof        = true;   // Depth of field
+    bool  motionBlur = true;
+
+    float exposure      = 1.0f;
+    int   tonemapOp     = 0;    // 0 = ACES filmic, 1 = Reinhard
+
+    bool  bloom           = false;
+    float bloomThreshold  = 1.0f;
+    float bloomKnee       = 0.1f;
+    int   bloomIterations = 5;    // H+V cycles; more = wider glow
+    float bloomIntensity  = 0.04f; // used in composite (CP4)
 };
 
 class Renderer {
@@ -23,7 +32,8 @@ public:
     Renderer(int width, int height);
     ~Renderer();
 
-    void render(Scene& scene, const Camera& camera, float deltaTime);
+    void render (Scene& scene, const Camera& camera, float deltaTime);
+    void resize (int w, int h);
 
 private:
     int   m_width, m_height;
@@ -33,6 +43,7 @@ private:
     unsigned int m_gPosition;         // world-space position
     unsigned int m_gNormal;           // world-space normal
     unsigned int m_gAlbedo;           // albedo + specular
+    unsigned int m_gEmissive  = 0;    // emissive RGB16F (attachment 4)
     unsigned int m_gDepth;
 
     unsigned int m_shadowFBO;         // shadow map pass
@@ -43,8 +54,8 @@ private:
     unsigned int m_hdrColor;
     unsigned int m_hdrDepth;
 
-    unsigned int m_pingpongFBO[2];    // for multi-pass post-process
-    unsigned int m_pingpongColor[2];
+    unsigned int m_pingpongFBO[2]   = {0, 0};  // bloom blur ping-pong (initialised in bloom checkpoint)
+    unsigned int m_pingpongColor[2] = {0, 0};
 
     unsigned int m_ssaoFBO        = 0;
     unsigned int m_ssaoColor      = 0;
@@ -59,6 +70,9 @@ private:
     Shader m_lightingShader;
     Shader m_ssaoShader;
     Shader m_ssaoBlurShader;
+    Shader m_brightPassShader;
+    Shader m_bloomBlurShader;
+    Shader m_bloomCompositeShader;
     Shader m_dofShader;
     Shader m_motionBlurShader;
     Shader m_tonemapShader;
@@ -80,10 +94,13 @@ private:
 
     void passShadow  (Scene& scene, const Camera& cam);
     void passGBuffer (Scene& scene, const Camera& cam);
-    void passSSAO    (const Camera& cam);
-    void passSSAOBlur();
-    void passLighting(Scene& scene, const Camera& cam);
-    void passDOF     ();
+    void passSSAO      (const Camera& cam);
+    void passSSAOBlur  ();
+    void passLighting  (Scene& scene, const Camera& cam);
+    void passBrightPass   ();
+    void passBloomBlur    ();
+    void passBloomComposite();
+    void passDOF       ();
     void passMotionBlur(const Camera& cam);
     void passTonemap ();
 };
