@@ -37,6 +37,10 @@ struct RenderSettings {
     bool  reflection   = false;
     float reflectivity = 0.25f;  // Fresnel scale
     float glossyBlur   = 0.0f;   // blur radius in texels (0 = sharp)
+
+    // ── Cubemap reflection probe ─────────────────────────────────────────────
+    bool  probeEnable   = true;
+    float probeStrength = 1.0f;
 };
 
 class Renderer {
@@ -46,8 +50,9 @@ public:
     Renderer(int width, int height);
     ~Renderer();
 
-    void render (Scene& scene, const Camera& camera, float deltaTime);
-    void resize (int w, int h);
+    void render      (Scene& scene, const Camera& camera, float deltaTime);
+    void resize      (int w, int h);
+    void requestBake () { m_probeDirty = true; }
 
 private:
     int   m_width, m_height;
@@ -75,6 +80,13 @@ private:
     unsigned int m_reflColor = 0;
     unsigned int m_reflDepth = 0;   // depth renderbuffer
 
+    unsigned int m_probeCubemap = 0;  // environment cubemap for glass reflections
+    unsigned int m_probeFBO     = 0;
+    unsigned int m_probeDepth   = 0;
+    bool         m_probeDirty   = true;   // bake on first frame and on requestBake()
+    bool         m_probeReady   = false;
+    static constexpr int PROBE_RES = 512;
+
     unsigned int m_ssaoFBO        = 0;
     unsigned int m_ssaoColor      = 0;
     unsigned int m_ssaoBlurFBO    = 0;
@@ -92,6 +104,7 @@ private:
     Shader m_bloomBlurShader;
     Shader m_bloomCompositeShader;
     Shader m_reflectionShader;
+    Shader m_probeShader;
     Shader m_glassShader;
     Shader m_dofShader;
     Shader m_motionBlurShader;
@@ -124,6 +137,7 @@ private:
     void passBrightPass   ();
     void passBloomBlur    ();
     void passBloomComposite();
+    void bakeCubemap   (Scene& scene);
     void passGlass     (Scene& scene, const Camera& cam);
     void passDOF       ();
     void passMotionBlur(const Camera& cam);

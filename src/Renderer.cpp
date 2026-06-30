@@ -19,6 +19,11 @@ static const glm::vec3 kCeilLights[4] = {
 };
 static const glm::vec3 kShadowLightPos(0.0f, 2.9f, 0.0f);
 
+// Probe bake constants — room AABB and probe centre
+static const glm::vec3 kProbePos(0.0f, 1.5f, 0.0f);
+static const glm::vec3 kRoomMin(-3.0f, 0.0f, -2.0f);
+static const glm::vec3 kRoomMax( 3.0f, 3.0f,  2.0f);
+
 Renderer::Renderer(int width, int height)
     : m_width(width), m_height(height) {
     initFramebuffers();
@@ -53,6 +58,10 @@ Renderer::~Renderer() {
     glDeleteTextures(1, &m_reflColor);
     glDeleteRenderbuffers(1, &m_reflDepth);
     glDeleteFramebuffers(1, &m_reflFBO);
+
+    glDeleteTextures(1, &m_probeCubemap);
+    glDeleteRenderbuffers(1, &m_probeDepth);
+    glDeleteFramebuffers(1, &m_probeFBO);
 
     if (m_quadVAO) {
         glDeleteVertexArrays(1, &m_quadVAO);
@@ -227,6 +236,36 @@ void Renderer::initFramebuffers() {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    // ── Cubemap reflection probe (fixed 512×512, RGB16F, mipmapped) ─────────
+    glGenTextures(1, &m_probeCubemap);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, m_probeCubemap);
+    for (int i = 0; i < 6; ++i)
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB16F,
+                     PROBE_RES, PROBE_RES, 0, GL_RGB, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+
+    glGenFramebuffers(1, &m_probeFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_probeFBO);
+
+    glGenRenderbuffers(1, &m_probeDepth);
+    glBindRenderbuffer(GL_RENDERBUFFER, m_probeDepth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, PROBE_RES, PROBE_RES);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                              GL_RENDERBUFFER, m_probeDepth);
+
+    // Attach face 0 so the FBO is complete for the status check;
+    // bakeCubemap() replaces the attachment per face before drawing.
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_CUBE_MAP_POSITIVE_X, m_probeCubemap, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "Probe framebuffer incomplete!\n";
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     // ── Bloom ping-pong FBOs (half resolution) ────────────────────────────────
     // [0] = bright-pass output / blur source
     // [1] = blur destination (they swap each iteration in CP3)
@@ -265,6 +304,7 @@ void Renderer::initShaders() {
     m_bloomBlurShader      = Shader("shaders/lighting.vert", "shaders/bloom_blur.frag");
     m_bloomCompositeShader = Shader("shaders/lighting.vert", "shaders/bloom_composite.frag");
     m_reflectionShader     = Shader("shaders/reflection.vert", "shaders/reflection.frag");
+    m_probeShader          = Shader("shaders/probe.vert",       "shaders/probe.frag");
     m_glassShader          = Shader("shaders/glass.vert",       "shaders/glass.frag");
     m_tonemapShader        = Shader("shaders/lighting.vert", "shaders/tonemap.frag");
 }
@@ -472,7 +512,9 @@ void Renderer::passReflection(Scene& scene, const Camera& cam) {
 
 void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glBindFramebuffer(GL_FRAMEBUFFER, m_hdrFBO);
+    glClearColor(0.02f, 0.025f, 0.04f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glDisable(GL_DEPTH_TEST);
 
     m_lightingShader.use();
@@ -616,6 +658,75 @@ void Renderer::passBloomComposite() {
     glEnable(GL_DEPTH_TEST);
 }
 
+void Renderer::bakeCubemap(Scene& scene) {
+    // Standard cubemap face directions + up vectors (OpenGL convention).
+    static const glm::vec3 dirs[6] = {
+        { 1, 0, 0}, {-1, 0, 0},   // +X, -X
+        { 0, 1, 0}, { 0,-1, 0},   // +Y, -Y
+        { 0, 0, 1}, { 0, 0,-1},   // +Z, -Z
+    };
+    static const glm::vec3 ups[6] = {
+        { 0,-1, 0}, { 0,-1, 0},   // +X, -X: up = -Y
+        { 0, 0, 1}, { 0, 0,-1},   // +Y: up = +Z;  -Y: up = -Z
+        { 0,-1, 0}, { 0,-1, 0},   // +Z, -Z: up = -Y
+    };
+
+    glm::mat4 faceProj = glm::perspective(glm::radians(90.0f), 1.0f, 0.1f, 50.0f);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_probeFBO);
+    glViewport(0, 0, PROBE_RES, PROBE_RES);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+
+    m_probeShader.use();
+
+    // Lights — identical values to passLighting (maintenance coupling)
+    for (int i = 0; i < 4; ++i) {
+        m_probeShader.setVec3 ("lightPositions["   + std::to_string(i) + "]", kCeilLights[i]);
+        m_probeShader.setVec3 ("lightColors["      + std::to_string(i) + "]", kLightColor);
+        m_probeShader.setFloat("lightIntensities[" + std::to_string(i) + "]", kLightIntensity);
+    }
+    m_probeShader.setInt  ("numLights",   4);
+    m_probeShader.setFloat("lightRadius", kLightRadius);
+    m_probeShader.setVec3 ("viewPos",     kProbePos);
+
+    // Shadow map is already rendered by passShadow() before this call
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, m_shadowMap);
+    m_probeShader.setInt ("shadowMap",        5);
+    m_probeShader.setMat4("lightSpaceMatrix", m_lightSpaceMatrix);
+    m_probeShader.setBool("useShadows",       true);
+
+    m_probeShader.setMat4("projection", faceProj);
+
+    // Empty space shows the same dark cool tint as the main HDR buffer
+    glClearColor(0.02f, 0.025f, 0.04f, 1.0f);
+
+    for (int face = 0; face < 6; ++face) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                               m_probeCubemap, 0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glm::mat4 faceView = glm::lookAt(kProbePos, kProbePos + dirs[face], ups[face]);
+        m_probeShader.setMat4("view", faceView);
+
+        scene.draw(m_probeShader);   // opaque only — glassObjects excluded by design
+    }
+
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Generate mipmaps so glass.frag can LOD for rough reflections in future
+    glBindTexture(GL_TEXTURE_CUBE_MAP, m_probeCubemap);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);
+
+    m_probeReady = true;
+}
+
 void Renderer::passGlass(Scene& scene, const Camera& cam) {
     if (scene.glassObjects.empty()) return;
 
@@ -643,10 +754,28 @@ void Renderer::passGlass(Scene& scene, const Camera& cam) {
                                       0.1f, 100.0f);
     m_glassShader.setMat4 ("view",        view);
     m_glassShader.setMat4 ("projection",  proj);
-    m_glassShader.setVec3 ("viewPos",     cam.Position);
+    m_glassShader.setVec3 ("viewPos",      cam.Position);
     m_glassShader.setFloat("glassOpacity", 0.12f);
     m_glassShader.setVec3 ("glassColor",   glm::vec3(0.01f, 0.02f, 0.03f));
     m_glassShader.setVec3 ("fresnelColor", glm::vec3(1.0f, 0.97f, 0.90f));
+    for (int i = 0; i < 4; ++i) {
+        m_glassShader.setVec3 ("lightPositions["   + std::to_string(i) + "]", kCeilLights[i]);
+        m_glassShader.setVec3 ("lightColors["      + std::to_string(i) + "]", kLightColor);
+        m_glassShader.setFloat("lightIntensities[" + std::to_string(i) + "]", kLightIntensity);
+    }
+    m_glassShader.setInt  ("numLights",    4);
+    m_glassShader.setFloat("lightRadius",  kLightRadius);
+
+    // Cubemap probe — unit 0 is safe: glass meshes have diffuseTexID=0 so
+    // Mesh::draw() never rebinds unit 0 for them.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, m_probeCubemap);
+    m_glassShader.setInt  ("envCubemap",    0);
+    m_glassShader.setBool ("useProbe",      settings.probeEnable && m_probeReady);
+    m_glassShader.setVec3 ("probePos",      kProbePos);
+    m_glassShader.setVec3 ("boxMin",        kRoomMin);
+    m_glassShader.setVec3 ("boxMax",        kRoomMax);
+    m_glassShader.setFloat("probeStrength", settings.probeStrength);
 
     scene.drawGlassSorted(m_glassShader, cam.Position);
 
@@ -697,6 +826,10 @@ void Renderer::passTonemap() {
 
 void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
     passShadow  (scene, camera);
+    if (m_probeDirty) {
+        bakeCubemap(scene);
+        m_probeDirty = false;
+    }
     if (settings.reflection)
         passReflection(scene, camera);
     passGBuffer (scene, camera);

@@ -30,6 +30,9 @@ if (NOT OpenAL_FOUND)
     find_package(openal-soft QUIET)
 endif()
 
+# Intel Open Image Denoise — optional CPU denoiser for the ray tracer path
+find_package(OpenImageDenoise QUIET)
+
 # ─────────────────────────────────────────────
 #  ImGui (vendored — copy files from imgui.io)
 # ─────────────────────────────────────────────
@@ -76,6 +79,7 @@ set(ENGINE_SOURCES
     src/Scene.cpp
     src/CinematicEngine.cpp
     src/AudioManager.cpp
+    src/RayTracer.cpp
 )
 
 add_executable(HorrorEngine ${ENGINE_SOURCES})
@@ -87,6 +91,7 @@ target_include_directories(HorrorEngine PRIVATE
     include
     external/glad/include
     external/stb
+    external/nanort
 )
 
 # ─────────────────────────────────────────────
@@ -107,6 +112,11 @@ endif()
 if(IMGUI_AVAILABLE)
     list(APPEND LINK_LIBS imgui)
     target_compile_definitions(HorrorEngine PRIVATE HAS_IMGUI)
+endif()
+
+if(OpenImageDenoise_FOUND)
+    list(APPEND LINK_LIBS OpenImageDenoise)
+    target_compile_definitions(HorrorEngine PRIVATE HAS_OIDN)
 endif()
 
 target_link_libraries(HorrorEngine PRIVATE ${LINK_LIBS})
@@ -151,6 +161,7 @@ message(STATUS "")
 message(STATUS "=== HorrorEngine Configuration ===")
 message(STATUS "  OpenAL sound:      ${OpenAL_FOUND}")
 message(STATUS "  ImGui UI:          ${IMGUI_AVAILABLE}")
+message(STATUS "  OIDN denoiser:     ${OpenImageDenoise_FOUND}  (brew install openimagedenoise)")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Output:            ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "==================================")

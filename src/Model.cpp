@@ -257,6 +257,38 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
     return m;
 }
 
+void Model::loadCPUAlbedo(const std::string& path) {
+    int w, h, ch;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!data) {
+        std::cerr << "[RT] CPU albedo load failed: " << path << "\n";
+        return;
+    }
+
+    auto tex = std::make_shared<CPUTexture>();
+    tex->width  = w;
+    tex->height = h;
+    tex->pixels.resize(w * h);
+
+    // sRGB → linear float (IEC 61966-2-1)
+    for (int i = 0; i < w * h; ++i) {
+        auto srgb = [](float c) -> float {
+            return c <= 0.04045f ? c / 12.92f
+                                 : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+        tex->pixels[i] = {
+            srgb(data[i*3+0] / 255.0f),
+            srgb(data[i*3+1] / 255.0f),
+            srgb(data[i*3+2] / 255.0f)
+        };
+    }
+    stbi_image_free(data);
+    std::cout << "[RT] CPU albedo: " << path << " (" << w << "×" << h << ")\n";
+
+    for (Mesh& m : m_meshes)
+        m.cpuAlbedo = tex;  // all meshes share one allocation
+}
+
 unsigned int Model::loadTexture(const std::string& path) {
     auto it = m_texCache.find(path);
     if (it != m_texCache.end())
