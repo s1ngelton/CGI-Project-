@@ -3,7 +3,10 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include "Shader.h"
+#include "ComputeShader.h"
 #include "Camera.h"
+#include "Model.h"
+
 
 // Forward declarations
 class Scene;
@@ -37,6 +40,15 @@ struct RenderSettings {
     bool  reflection   = false;
     float reflectivity = 0.25f;  // Fresnel scale
     float glossyBlur   = 0.0f;   // blur radius in texels (0 = sharp)
+    
+    //Raytracing settings
+    int numSamples = 32;
+    int lightSamples;
+
+    //Denoising settings
+    float sigmaColor = 0.2;
+    float sigmaDepth = 5.0;
+    float sigmaNormal = 0.25;
 };
 
 class Renderer {
@@ -45,12 +57,18 @@ public:
 
     Renderer(int width, int height);
     ~Renderer();
+    void LoadScene(Scene& scene);
 
-    void render (Scene& scene, const Camera& camera, float deltaTime);
+    void saveRayTracingImage(const std::string& filename);
+    void saveFinalImage(const std::string& filename);
+
+    void renderRaytracing (Scene& scene, const Camera& camera, float deltaTime, float time);
+    void renderRasterizer (Scene& scene, const Camera& camera, float deltaTime, float time);
     void resize (int w, int h);
 
 private:
     int   m_width, m_height;
+    float m_time;
 
     // ── Framebuffers ────────────────────────────────────────────────────────
     unsigned int m_gBuffer;           // G-buffer for deferred shading
@@ -68,6 +86,9 @@ private:
     unsigned int m_hdrColor;
     unsigned int m_hdrDepth;
 
+    unsigned int m_bloomTex = 0;
+    unsigned int m_bloomFBO = 0;
+
     unsigned int m_pingpongFBO[2]   = {0, 0};  // bloom blur ping-pong (initialised in bloom checkpoint)
     unsigned int m_pingpongColor[2] = {0, 0};
 
@@ -81,6 +102,35 @@ private:
     unsigned int m_ssaoBlurColor  = 0;
     unsigned int m_ssaoNoise      = 0;
     std::vector<glm::vec3> m_ssaoKernel;
+
+    unsigned int m_denoisedFBO = 0;
+
+    unsigned int m_screenTex;
+    unsigned int m_reflPos;
+    unsigned int m_reflNorm;
+    unsigned int m_denoisedTex = 0;
+    
+    unsigned int m_textureTex;
+
+    unsigned int m_finalTex = 0;
+
+    unsigned int m_vertexSSBO;
+    unsigned int m_indexSSBO;
+    unsigned int m_meshSSBO;
+    unsigned int m_lightTriangleSSBO;
+
+    unsigned int m_bvhNodeSSBO = 0;
+    unsigned int m_bvhLeafCountSSBO = 0;
+    unsigned int m_bvhTrisSSBO = 0;
+    unsigned int m_triMeshSSBO = 0;
+    std::vector<uint32_t> m_triMesh;
+
+    float m_totalEmissiveArea = 0.0;
+
+    std::vector<Vertex> m_vertices;
+    std::vector<uint32_t> m_indices;
+    std::vector<MeshInfo> m_meshes;
+    std::vector<LightTriangle> m_lightTriangles;
 
     // ── Shaders ─────────────────────────────────────────────────────────────
     Shader m_gBufferShader;
@@ -96,6 +146,10 @@ private:
     Shader m_dofShader;
     Shader m_motionBlurShader;
     Shader m_tonemapShader;
+    Shader m_ScreenSampler2D;
+    Shader m_denoiserShader;
+
+    ComputeShader m_rayTracerShader;
 
     // ── Screen quad ─────────────────────────────────────────────────────────
     unsigned int m_quadVAO = 0;
@@ -111,6 +165,7 @@ private:
     glm::mat4 m_reflectionProjView = glm::mat4(1.0f);
 
     void initFramebuffers();
+    void initRayTracingSSBOs(Scene& scene);
     void initShaders();
     void initSSAOKernel();
     void renderQuad();
@@ -121,11 +176,21 @@ private:
     void passSSAO      (const Camera& cam);
     void passSSAOBlur  ();
     void passLighting  (Scene& scene, const Camera& cam);
-    void passBrightPass   ();
-    void passBloomBlur    ();
-    void passBloomComposite();
+    void passBrightPass(GLuint inputTex);
+    void passBloomComposite(GLuint inputTex, GLuint outputFBO);
+    void passBloomBlur();
+    void applyBloom(GLuint inputTex, GLuint outputFBO);
     void passGlass     (Scene& scene, const Camera& cam);
     void passDOF       ();
     void passMotionBlur(const Camera& cam);
-    void passTonemap ();
+    void passTonemap();
+    void passDenoiser();
+    void applyDenoiserIterations(int iterations);
+
+    void UploadScene(const Scene& scene);
+    void buildBVH(std::vector<TriangleRef>& tris, uint32_t start, uint32_t end, std::vector<BVHNode>& nodes,
+    std::vector<uint32_t>& leafCounts, std::vector<uint32_t>& bvhTris, const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices, uint32_t& nextNodeId);
+    void buildAndUploadBVH();
+    void UploadSceneToGPU();
+    void passRayTracing (const Camera& cam);
 };

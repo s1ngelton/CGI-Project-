@@ -144,8 +144,8 @@ void Model::draw(Shader& shader) const {
         mesh.draw(shader);
 }
 
-std::pair<glm::vec3, glm::vec3> Model::computeAABB() const {
-    glm::vec3 mn( 1e30f), mx(-1e30f);
+std::pair<glm::vec4, glm::vec4> Model::computeAABB() const {
+    glm::vec4 mn( 1e30f), mx(-1e30f);
     for (const Mesh& mesh : m_meshes)
         for (const Vertex& v : mesh.vertices) {
             mn = glm::min(mn, v.Position);
@@ -186,16 +186,16 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
     vertices.reserve(mesh->mNumVertices);
     for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
         Vertex v;
-        v.Position  = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
+        v.Position  = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z , 0.0};
         v.Normal    = mesh->HasNormals()
-                      ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)
-                      : glm::vec3(0.0f, 1.0f, 0.0f);
+                      ? glm::vec4(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z, 0.0)
+                      : glm::vec4(0.0f, 1.0f, 0.0f, 0.0);
         v.TexCoords = mesh->mTextureCoords[0]
                       ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y)
                       : glm::vec2(0.0f);
         v.Tangent   = mesh->mTangents
-                      ? glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
-                      : glm::vec3(1.0f, 0.0f, 0.0f);
+                      ? glm::vec4(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z, 0.0)
+                      : glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
         vertices.push_back(v);
     }
 
@@ -219,6 +219,7 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene) {
         if (mat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
             diffuseTex = loadTexture(m_directory + "/" + texPath.C_Str());
             m.diffuseTexID = diffuseTex;
+            std::cout << diffuseTex << "\n";
         }
         if (diffuseTex == 0) {
             aiColor3D col(0.8f, 0.8f, 0.8f);
