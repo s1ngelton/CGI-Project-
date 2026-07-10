@@ -19,11 +19,21 @@ static const glm::vec3 kCeilLights[4] = {
 };
 static const glm::vec3 kShadowLightPos(0.0f, 2.9f, 0.0f);
 
+
 Renderer::Renderer(int width, int height)
     : m_width(width), m_height(height) {
     initFramebuffers();
     initShaders();
     initSSAOKernel();
+
+    
+}
+
+void Renderer::LoadScene(Scene& scene){
+    UploadScene(scene);
+    UploadSceneToGPU();
+    buildAndUploadBVH();
+
 }
 
 Renderer::~Renderer() {
@@ -54,10 +64,35 @@ Renderer::~Renderer() {
     glDeleteRenderbuffers(1, &m_reflDepth);
     glDeleteFramebuffers(1, &m_reflFBO);
 
+    glDeleteTextures(1, &m_denoisedTex);
+    glDeleteFramebuffers(1, &m_denoisedFBO);
+
+    glDeleteTextures(1, &m_bloomTex);
+    glDeleteFramebuffers(1, &m_bloomFBO);
+
     if (m_quadVAO) {
         glDeleteVertexArrays(1, &m_quadVAO);
         glDeleteBuffers(1, &m_quadVBO);
     }
+
+    if (m_screenTex) glDeleteTextures(1, &m_screenTex);
+    if (m_reflPos) glDeleteTextures(1, &m_reflPos);
+    if (m_reflNorm) glDeleteTextures(1, &m_reflNorm);
+    if (m_textureTex) glDeleteTextures(1, &m_textureTex);
+    /*
+    if (m_normalTex) glDeleteTextures(1, &m_normalTex);
+    if (m_metallicTex) glDeleteTextures(1, &m_metallicTex);
+    if (m_roughnessTex) glDeleteTextures(1, &m_roughnessTex);
+*/
+    if (m_vertexSSBO) glDeleteBuffers(1, &m_vertexSSBO);
+    if (m_indexSSBO)  glDeleteBuffers(1, &m_indexSSBO);
+    if (m_meshSSBO)   glDeleteBuffers(1, &m_meshSSBO);
+    if (m_lightTriangleSSBO)   glDeleteBuffers(1, &m_lightTriangleSSBO);
+
+    glDeleteBuffers(1, &m_bvhNodeSSBO);
+    glDeleteBuffers(1, &m_bvhLeafCountSSBO);
+    glDeleteBuffers(1, &m_bvhTrisSSBO);
+    glDeleteBuffers(1, &m_triMeshSSBO);
 }
 
 // ── Framebuffer init ─────────────────────────────────────────────────────────
@@ -227,6 +262,21 @@ void Renderer::initFramebuffers() {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    //Bloom blur FBO
+    // Bloom composite result (full resolution, for raytracing)
+    glGenTextures(1, &m_bloomTex);
+    glBindTexture(GL_TEXTURE_2D, m_bloomTex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, m_width, m_height);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenFramebuffers(1, &m_bloomFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_bloomFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_bloomTex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     // ── Bloom ping-pong FBOs (half resolution) ────────────────────────────────
     // [0] = bright-pass output / blur source
     // [1] = blur destination (they swap each iteration in CP3)
@@ -251,6 +301,76 @@ void Renderer::initFramebuffers() {
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
+
+    //Raytracer denoiser FBO
+
+    // Denoised output texture
+    glGenTextures(1, &m_denoisedTex);
+    glBindTexture(GL_TEXTURE_2D, m_denoisedTex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, m_width, m_height);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // FBO for denoised output
+    glGenFramebuffers(1, &m_denoisedFBO);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_denoisedFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_denoisedTex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "Denoised FBO incomplete!\n";
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+
+    //RayTracing Output Texture
+    glGenTextures(1, &m_screenTex);
+    glBindTexture(GL_TEXTURE_2D, m_screenTex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, m_width, m_height); // <-- 1, not 0
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &m_reflPos);
+    glBindTexture(GL_TEXTURE_2D, m_reflPos);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, m_width, m_height);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    glGenTextures(1, &m_reflNorm);
+    glBindTexture(GL_TEXTURE_2D, m_reflNorm);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, m_width, m_height);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+
+    glGenTextures(1, &m_textureTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_textureTex);
+
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 1028, 1028, 64); // Change to dynamic size
+/*
+    glGenTextures(1, &m_normalTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_normalTex);
+
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 1028, 1028, 64); // Change to dynamic size
+
+    glGenTextures(1, &m_metallicTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_metallicTex);
+
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 1028, 1028, 64); // Change to dynamic size
+
+    glGenTextures(1, &m_roughnessTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_roughnessTex);
+
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, 1028, 1028, 64); // Change to dynamic size
+*/
+    //RayTracing SSBOs
+    glGenBuffers(1, &m_vertexSSBO);
+    glGenBuffers(1, &m_indexSSBO);
+    glGenBuffers(1, &m_meshSSBO);
+    glGenBuffers(1, &m_lightTriangleSSBO);
+    
+
 }
 
 // ── Shader init ──────────────────────────────────────────────────────────────
@@ -267,6 +387,10 @@ void Renderer::initShaders() {
     m_reflectionShader     = Shader("shaders/reflection.vert", "shaders/reflection.frag");
     m_glassShader          = Shader("shaders/glass.vert",       "shaders/glass.frag");
     m_tonemapShader        = Shader("shaders/lighting.vert", "shaders/tonemap.frag");
+    m_ScreenSampler2D       = Shader("shaders/sampler2D.vert", "shaders/sampler2D.frag");
+    m_denoiserShader        = Shader("shaders/sampler2D.vert", "shaders/denoiser.frag");
+
+    m_rayTracerShader = ComputeShader("shaders/raytrace.comp");
 }
 
 void Renderer::initSSAOKernel() {
@@ -300,6 +424,313 @@ void Renderer::initSSAOKernel() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+// RayTracer init
+void Renderer::buildBVH(
+    std::vector<TriangleRef>& tris,
+    uint32_t start,
+    uint32_t end,
+    std::vector<BVHNode>& nodes,
+    std::vector<uint32_t>& leafCounts,
+    std::vector<uint32_t>& bvhTris,
+    const std::vector<Vertex>& vertices,
+    const std::vector<uint32_t>& indices,
+    uint32_t& nextNodeId
+) {
+    // 1. Compute bounding box for this range
+    glm::vec3 bboxMin = glm::vec3(FLT_MAX);
+    glm::vec3 bboxMax = glm::vec3(-FLT_MAX);
+    for (uint32_t i = start; i < end; ++i) {
+        uint32_t triIdx = tris[i].triIdx;
+        glm::vec3 v0 = glm::vec3(vertices[indices[triIdx]].Position);
+        glm::vec3 v1 = glm::vec3(vertices[indices[triIdx + 1]].Position);
+        glm::vec3 v2 = glm::vec3(vertices[indices[triIdx + 2]].Position);
+        bboxMin = glm::min(bboxMin, glm::min(glm::min(v0, v1), v2));
+        bboxMax = glm::max(bboxMax, glm::max(glm::max(v0, v1), v2));
+    }
+
+    // 2. Create the node (placeholder)
+    BVHNode node;
+    node.bboxMin = bboxMin;
+    node.bboxMax = bboxMax;
+    node.leftChild = 0xFFFFFFFF; // default leaf
+    node.rightChild = 0;
+
+    uint32_t nodeIdx = nextNodeId++;
+    nodes.push_back(node);
+    leafCounts.push_back(0); // placeholder
+
+    // 3. If small enough, create a leaf
+    const uint32_t LEAF_SIZE = 4;
+    if (end - start <= LEAF_SIZE) {
+        // Store the start index in bvhTris
+        nodes[nodeIdx].rightChild = (uint32_t)bvhTris.size();
+        leafCounts[nodeIdx] = end - start;
+        for (uint32_t i = start; i < end; ++i) {
+            bvhTris.push_back(tris[i].triIdx);
+        }
+        return;
+    }
+
+    // 4. Internal node: choose split axis (longest extent)
+    glm::vec3 extent = bboxMax - bboxMin;
+    int axis = 0;
+    if (extent.y > extent.x) axis = 1;
+    if (extent.z > extent[axis]) axis = 2;
+
+    // 5. Sort triangles by centroid along this axis
+    std::sort(tris.begin() + start, tris.begin() + end,
+        [axis](const TriangleRef& a, const TriangleRef& b) {
+            return a.centroid[axis] < b.centroid[axis];
+        });
+
+    // 6. Split at the median
+    uint32_t mid = (start + end) / 2;
+    // Avoid empty children
+    if (mid == start) mid = start + 1;
+    if (mid == end) mid = end - 1;
+
+    // 7. Recurse
+    uint32_t leftChildIdx = nextNodeId;
+    buildBVH(tris, start, mid, nodes, leafCounts, bvhTris, vertices, indices, nextNodeId);
+    uint32_t rightChildIdx = nextNodeId;
+    buildBVH(tris, mid, end, nodes, leafCounts, bvhTris, vertices, indices, nextNodeId);
+
+    // 8. Update the internal node
+    nodes[nodeIdx].leftChild = leftChildIdx;
+    nodes[nodeIdx].rightChild = rightChildIdx;
+}
+
+void Renderer::UploadScene(const Scene& scene)
+{
+    m_vertices.clear();
+    m_indices.clear();
+    m_meshes.clear();
+    m_lightTriangles.clear();
+
+    for (const SceneObject& object : scene.objects)
+    {
+        const Model& model = object.model;
+
+        for (const Mesh& mesh : model.GetMeshes())
+        {
+
+            uint32_t vertexOffset = (uint32_t)m_vertices.size();
+            uint32_t indexOffset  = (uint32_t)m_indices.size();
+
+            MeshInfo info;
+            
+            info.firstIndex = indexOffset;
+            info.indexCount = (uint32_t)mesh.indices.size();
+            info.materialIndex = mesh.diffuseTexID;
+            
+         
+            info.albedoColor = glm::vec4(mesh.albedoColor, 1.0);
+            info.emissiveColor = glm::vec4(mesh.emissiveColor, 1.0);
+            info.emissiveStrength = mesh.emissiveStrength;
+            info.metallic = mesh.metallic;
+            info.roughness = mesh.roughness;
+            info.ior = mesh.IOR;
+
+            m_meshes.push_back(info);
+
+            m_vertices.insert(m_vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
+
+            for (uint32_t i : mesh.indices){
+                m_indices.push_back(i+vertexOffset);
+            }
+            
+
+            if (info.emissiveStrength > .0) {
+                for (uint32_t i = 0; i < mesh.indices.size(); i+=3){
+                    LightTriangle lightTri;
+                
+                    lightTri.emission = glm::vec4(mesh.emissiveColor * mesh.emissiveStrength, 1.0);
+
+                    glm::vec4 p0 = mesh.vertices[mesh.indices[i]].Position;
+                    glm::vec4 p1 = mesh.vertices[mesh.indices[i+1]].Position;
+                    glm::vec4 p2 = mesh.vertices[mesh.indices[i+2]].Position;
+                    lightTri.v0 = p0;
+                    lightTri.v1 = p1;
+                    lightTri.v2 = p2;
+
+                    lightTri.area = 0.5f * glm::length(glm::cross(glm::vec3(p1 - p0), glm::vec3(p2 - p0)));
+                    m_totalEmissiveArea += lightTri.area;
+                    lightTri.cumArea = m_totalEmissiveArea;
+
+                    m_lightTriangles.push_back(lightTri);
+                }
+                    
+            }
+
+            
+
+        }
+    }
+
+    for (const SceneObject& object : scene.glassObjects)
+    {
+        const Model& model = object.model;
+
+        for (const Mesh& mesh : model.GetMeshes())
+        {
+
+            uint32_t vertexOffset = (uint32_t)m_vertices.size();
+            uint32_t indexOffset  = (uint32_t)m_indices.size();
+
+            MeshInfo info;
+            
+            info.firstIndex = indexOffset;
+            info.indexCount = (uint32_t)mesh.indices.size();
+            info.materialIndex = mesh.diffuseTexID;
+            
+         
+            info.albedoColor = glm::vec4(mesh.albedoColor, 1.0);
+            info.emissiveColor = glm::vec4(mesh.emissiveColor, 1.0);
+            info.emissiveStrength = mesh.emissiveStrength;
+            info.metallic = mesh.metallic;
+            info.roughness = mesh.roughness;
+            info.ior = mesh.IOR;
+
+            m_meshes.push_back(info);
+
+            m_vertices.insert(m_vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
+
+            for (uint32_t i : mesh.indices){
+                m_indices.push_back(i+vertexOffset);
+            }
+            
+
+            
+
+            if (info.emissiveStrength > .0) {
+                for (uint32_t i = 0; i < mesh.indices.size(); i+=3){
+                    LightTriangle lightTri;
+                
+                    lightTri.emission = glm::vec4(mesh.emissiveColor * mesh.emissiveStrength, 1.0);
+
+                    glm::vec4 p0 = mesh.vertices[mesh.indices[i]].Position;
+                    glm::vec4 p1 = mesh.vertices[mesh.indices[i+1]].Position;
+                    glm::vec4 p2 = mesh.vertices[mesh.indices[i+2]].Position;
+                    lightTri.v0 = p0;
+                    lightTri.v1 = p1;
+                    lightTri.v2 = p2;
+
+                    lightTri.area = 0.5f * glm::length(glm::cross(glm::vec3(p1 - p0), glm::vec3(p2 - p0)));
+                    m_totalEmissiveArea += lightTri.area;
+                    lightTri.cumArea = m_totalEmissiveArea;
+
+                    m_lightTriangles.push_back(lightTri);
+                }
+                    
+            }
+
+            
+
+        }
+    }
+}
+
+void Renderer::buildAndUploadBVH()
+{
+    // --- 1. Build triMesh (maps triangle index -> mesh ID) ---
+    m_triMesh.resize(m_indices.size() / 3, 0);
+    for (uint32_t m = 0; m < m_meshes.size(); ++m) {
+        const MeshInfo& mesh = m_meshes[m];
+        for (uint32_t i = 0; i < mesh.indexCount; i += 3) {
+            uint32_t triIdx = mesh.firstIndex + i; // global first index of triangle (in m_indices)
+            m_triMesh[triIdx / 3] = m;
+        }
+    }
+
+    // --- 2. Build TriangleRef list (centroids) ---
+    std::vector<TriangleRef> tris;
+    tris.reserve(m_indices.size() / 3);
+    for (uint32_t i = 0; i < m_indices.size(); i += 3) {
+        TriangleRef ref;
+        ref.triIdx = i;
+        glm::vec3 v0 = glm::vec3(m_vertices[m_indices[i]].Position);
+        glm::vec3 v1 = glm::vec3(m_vertices[m_indices[i + 1]].Position);
+        glm::vec3 v2 = glm::vec3(m_vertices[m_indices[i + 2]].Position);
+        ref.centroid = (v0 + v1 + v2) / 3.0f;
+        tris.push_back(ref);
+    }
+
+    // --- 3. Build BVH recursively ---
+    std::vector<BVHNode> nodes;
+    std::vector<uint32_t> leafCounts;
+    std::vector<uint32_t> bvhTris;
+    nodes.reserve(tris.size() * 2);
+    leafCounts.reserve(tris.size() * 2);
+    bvhTris.reserve(tris.size());
+
+    uint32_t nextNodeId = 0;
+    buildBVH(tris, 0, (uint32_t)tris.size(), nodes, leafCounts, bvhTris, m_vertices, m_indices, nextNodeId);
+
+    // --- 4. Upload to SSBOs (bindings 5-8) ---
+
+    // BVH nodes (binding 5)
+    glGenBuffers(1, &m_bvhNodeSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_bvhNodeSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, nodes.size() * sizeof(BVHNode), nodes.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_bvhNodeSSBO);
+
+    // Leaf counts (binding 6)
+    glGenBuffers(1, &m_bvhLeafCountSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_bvhLeafCountSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, leafCounts.size() * sizeof(uint32_t), leafCounts.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_bvhLeafCountSSBO);
+
+    // BVH triangle indices (binding 7)
+    glGenBuffers(1, &m_bvhTrisSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_bvhTrisSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvhTris.size() * sizeof(uint32_t), bvhTris.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, m_bvhTrisSSBO);
+
+    // triMesh mapping (binding 8)
+    glGenBuffers(1, &m_triMeshSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_triMeshSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, m_triMesh.size() * sizeof(uint32_t), m_triMesh.data(), GL_STATIC_DRAW);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, m_triMeshSSBO);
+
+    // Optional: print stats
+    std::cout << "BVH built: " << nodes.size() << " nodes, " << bvhTris.size() << " triangles in leaves\n";
+}
+
+void Renderer::UploadSceneToGPU()
+{
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_vertexSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+        m_vertices.size() * sizeof(Vertex),
+        m_vertices.data(),
+        GL_DYNAMIC_DRAW);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_vertexSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_indexSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+        m_indices.size() * sizeof(uint32_t),
+        m_indices.data(),
+        GL_DYNAMIC_DRAW);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_indexSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_meshSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+        m_meshes.size() * sizeof(MeshInfo),
+        m_meshes.data(),
+        GL_DYNAMIC_DRAW);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_meshSSBO);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_lightTriangleSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+        m_lightTriangles.size() * sizeof(LightTriangle),
+        m_lightTriangles.data(),
+        GL_DYNAMIC_DRAW);
+
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_lightTriangleSSBO);
+}
+
 // ── Screen quad (used by post-process passes) ─────────────────────────────────
 
 void Renderer::renderQuad() {
@@ -325,6 +756,91 @@ void Renderer::renderQuad() {
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 }
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+void Renderer::saveRayTracingImage(const std::string& filename) {
+    glFinish();
+
+    // 1. Read RGBA float pixels
+    std::vector<float> pixels(m_width * m_height * 4);
+    glBindTexture(GL_TEXTURE_2D, m_screenTex);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, pixels.data());
+
+    // 2. Convert to 8‑bit sRGB (gamma correct) and store in a linear array
+    //    This is a flat RGB array, row-major, **top‑to‑bottom**.
+    std::vector<unsigned char> image8(m_width * m_height * 3);
+    for (int y = 0; y < m_height; ++y) {
+        // OpenGL texture is bottom‑up, so we flip vertically here:
+        int srcRow = (m_height - 1 - y); // source row (bottom-up)
+        for (int x = 0; x < m_width; ++x) {
+            int srcIdx = (srcRow * m_width + x) * 4;
+            int dstIdx = (y * m_width + x) * 3;
+
+            float r = pixels[srcIdx + 0];
+            float g = pixels[srcIdx + 1];
+            float b = pixels[srcIdx + 2];
+
+            // Clamp and gamma correct (linear → sRGB)
+            r = std::pow(std::min(r, 1.0f), 1.0f / 2.2f);
+            g = std::pow(std::min(g, 1.0f), 1.0f / 2.2f);
+            b = std::pow(std::min(b, 1.0f), 1.0f / 2.2f);
+
+            image8[dstIdx + 0] = static_cast<unsigned char>(r * 255.0f);
+            image8[dstIdx + 1] = static_cast<unsigned char>(g * 255.0f);
+            image8[dstIdx + 2] = static_cast<unsigned char>(b * 255.0f);
+        }
+    }
+
+    // 3. Write PNG with positive stride (no flip needed anymore)
+    int stride = m_width * 3; // positive stride, because we already flipped
+    if (!stbi_write_png(filename.c_str(), m_width, m_height, 3,
+                        image8.data(), stride)) {
+        std::cerr << "Failed to write PNG: " << filename << std::endl;
+    } else {
+        std::cout << "PNG saved: " << filename << std::endl;
+    }
+    
+}
+void Renderer::saveFinalImage(const std::string& filename) {
+    // Make sure we use the texture that was displayed
+    if (m_finalTex == 0) {
+        std::cerr << "No final texture to save!" << std::endl;
+        return;
+    }
+
+    glFinish();
+
+    // Read pixels from the texture directly (no need to render to screen)
+    std::vector<float> pixels(m_width * m_height * 4);
+    glBindTexture(GL_TEXTURE_2D, m_finalTex);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, pixels.data());
+
+    // Convert to 8-bit sRGB and flip
+    std::vector<unsigned char> image8(m_width * m_height * 3);
+    for (int y = 0; y < m_height; ++y) {
+        int srcRow = (m_height - 1 - y);
+        for (int x = 0; x < m_width; ++x) {
+            int srcIdx = (srcRow * m_width + x) * 4;
+            int dstIdx = (y * m_width + x) * 3;
+            float r = std::pow(std::min(pixels[srcIdx + 0], 1.0f), 1.0f / 2.2f);
+            float g = std::pow(std::min(pixels[srcIdx + 1], 1.0f), 1.0f / 2.2f);
+            float b = std::pow(std::min(pixels[srcIdx + 2], 1.0f), 1.0f / 2.2f);
+            image8[dstIdx + 0] = static_cast<unsigned char>(r * 255.0f);
+            image8[dstIdx + 1] = static_cast<unsigned char>(g * 255.0f);
+            image8[dstIdx + 2] = static_cast<unsigned char>(b * 255.0f);
+        }
+    }
+
+    int stride = m_width * 3;
+    if (!stbi_write_png(filename.c_str(), m_width, m_height, 3, image8.data(), stride)) {
+        std::cerr << "Failed to write PNG: " << filename << std::endl;
+    } else {
+        std::cout << "Saved final image: " << filename << std::endl;
+    }
+}
+
 
 // ── Render passes ─────────────────────────────────────────────────────────────
 
@@ -536,29 +1052,108 @@ void Renderer::passLighting(Scene& scene, const Camera& cam) {
     glEnable(GL_DEPTH_TEST);
 }
 
-void Renderer::passBrightPass() {
-    // Extract HDR pixels above threshold into ping-pong[0] at half resolution.
-    // passTonemap() restores the viewport to full-res afterwards.
+void Renderer::passRayTracing(const Camera& cam)
+{
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);
+    glDisable(GL_DEPTH_TEST);
+
+
+    m_rayTracerShader.use();
+
+    m_rayTracerShader.setFloat("time", m_time);
+
+    m_rayTracerShader.setUInt("numSamples", settings.numSamples);
+    m_rayTracerShader.setUInt("diffuseSamples", settings.lightSamples);
+    m_rayTracerShader.setUInt("emissiveCount", m_lightTriangles.size());
+    m_rayTracerShader.setFloat("totalEmissiveArea", m_totalEmissiveArea);
+
+    m_rayTracerShader.setVec3("camPos", cam.Position);
+    m_rayTracerShader.setVec2("resolution", glm::vec2(m_width, m_height));
+    m_rayTracerShader.setFloat("time", 1.0);
+    glm::mat4 view = cam.GetViewMatrix();
+    glm::mat4 camWorld = inverse(view);
+    m_rayTracerShader.setMat4("camWorld", camWorld);
+    
+
+    glBindImageTexture(0, m_screenTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glBindImageTexture(1, m_reflPos, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    glBindImageTexture(2, m_reflNorm, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+
+    GLuint gx = (m_width  + 15) / 16;
+    GLuint gy = (m_height + 15) / 16;
+    
+    glDispatchCompute(gx, gy, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |GL_TEXTURE_FETCH_BARRIER_BIT);
+
+    m_ScreenSampler2D.use();
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_screenTex);
+
+    glUniform1i(glGetUniformLocation(m_ScreenSampler2D.ID, "renderedImage"), 0);
+
+    renderQuad();
+}
+
+void Renderer::applyDenoiserIterations(int iterations) {
+    for (int i = 0; i < iterations; ++i) {
+        // Each pass reads m_screenTex, writes to m_denoisedTex
+        passDenoiser();
+        // Swap so the next iteration reads the denoised result
+        std::swap(m_screenTex, m_denoisedTex);
+    }
+    std::swap(m_screenTex, m_denoisedTex);
+}
+
+void Renderer::passDenoiser() {
+    glDisable(GL_DEPTH_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_denoisedFBO);
+    glViewport(0, 0, m_width, m_height);
+
+    m_denoiserShader.use();
+
+    m_denoiserShader.setFloat("sigma_depth", settings.sigmaDepth);    // Allow blur across the whole room
+    m_denoiserShader.setFloat("sigma_normal", settings.sigmaNormal);   // Allow slight normal variations
+    m_denoiserShader.setFloat("sigma_color", settings.sigmaColor);    // Linear color weight (works for 0-2 values)
+    
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_screenTex);
+    m_denoiserShader.setInt("noisyImage", 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_reflPos);
+    m_denoiserShader.setInt("guidePos", 1);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, m_reflNorm);
+    m_denoiserShader.setInt("guideNorm", 2);
+
+    renderQuad();
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glEnable(GL_DEPTH_TEST);
+}
+
+
+void Renderer::passBrightPass(GLuint inputTex) {
     glBindFramebuffer(GL_FRAMEBUFFER, m_pingpongFBO[0]);
     glViewport(0, 0, m_width / 2, m_height / 2);
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_DEPTH_TEST);
 
     m_brightPassShader.use();
-
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_hdrColor);
-    m_brightPassShader.setInt  ("hdrBuffer", 0);
+    glBindTexture(GL_TEXTURE_2D, inputTex);
+    m_brightPassShader.setInt("hdrBuffer", 0);
     m_brightPassShader.setFloat("threshold", settings.bloomThreshold);
-    m_brightPassShader.setFloat("knee",      settings.bloomKnee);
+    m_brightPassShader.setFloat("knee", settings.bloomKnee);
 
     renderQuad();
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
-    // Viewport intentionally left at half-res; passBloomBlur runs at the same res.
 }
-
 void Renderer::passBloomBlur() {
     // Ping-pong separable Gaussian blur at half resolution.
     // Each iteration: H-pass [0]→[1], V-pass [1]→[0].
@@ -592,12 +1187,8 @@ void Renderer::passBloomBlur() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
 }
-
-void Renderer::passBloomComposite() {
-    // Additively blend blurred bloom (m_pingpongColor[0]) back into m_hdrFBO.
-    // GL_ONE + GL_ONE means: hdr_dst = hdr_dst + bloom_src.  No read-write
-    // hazard because we write to m_hdrFBO while sampling m_pingpongColor[0].
-    glBindFramebuffer(GL_FRAMEBUFFER, m_hdrFBO);
+void Renderer::passBloomComposite(GLuint inputTex, GLuint outputFBO) {
+    glBindFramebuffer(GL_FRAMEBUFFER, outputFBO);
     glViewport(0, 0, m_width, m_height);
     glDisable(GL_DEPTH_TEST);
 
@@ -606,15 +1197,30 @@ void Renderer::passBloomComposite() {
 
     m_bloomCompositeShader.use();
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_pingpongColor[0]);
-    m_bloomCompositeShader.setInt  ("bloomBlur",      0);
+    glBindTexture(GL_TEXTURE_2D, inputTex);
+    m_bloomCompositeShader.setInt("hdrBuffer", 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_pingpongColor[0]); // blurred bloom
+    m_bloomCompositeShader.setInt("bloomBlur", 1);
     m_bloomCompositeShader.setFloat("bloomIntensity", settings.bloomIntensity);
+
     renderQuad();
 
     glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
 }
+
+void Renderer::applyBloom(GLuint inputTex, GLuint outputFBO) {
+    // 1. Bright‑pass
+    passBrightPass(inputTex);
+    // 2. Blur (uses ping‑pong, always works)
+    passBloomBlur();
+    // 3. Composite
+    passBloomComposite(inputTex, outputFBO);
+}
+
 
 void Renderer::passGlass(Scene& scene, const Camera& cam) {
     if (scene.glassObjects.empty()) return;
@@ -695,7 +1301,44 @@ void Renderer::passTonemap() {
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
+void Renderer::renderRaytracing(Scene& scene, const Camera& camera, float deltaTime, float time) {
+    m_time = time;
+
+    // 1. Raytrace -> m_screenTex
+    passRayTracing(camera);
+
+    // 2. Denoise -> m_denoisedTex
+    applyDenoiserIterations(1); // reads m_screenTex, writes to m_denoisedTex
+
+    // 3. Determine final texture
+    GLuint finalTex = m_denoisedTex;
+
+    // 4. Apply bloom (if enabled)
+    if (settings.bloom) {
+        // Bloom reads m_denoisedTex, writes to m_bloomTex
+        applyBloom(m_denoisedTex, m_bloomFBO);
+        finalTex = m_bloomTex; // final is now in bloomTex
+    }
+
+    // 5. Display the final image on screen
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, m_width, m_height);
+    glDisable(GL_DEPTH_TEST);
+
+    m_ScreenSampler2D.use();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, finalTex);
+    glUniform1i(glGetUniformLocation(m_ScreenSampler2D.ID, "renderedImage"), 0);
+    renderQuad();
+
+    glEnable(GL_DEPTH_TEST);
+
+    // Store the final texture for saving later
+    m_finalTex = finalTex;
+}
+
+void Renderer::renderRasterizer(Scene& scene, const Camera& camera, float deltaTime, float time) {
+    m_time = time;
     passShadow  (scene, camera);
     if (settings.reflection)
         passReflection(scene, camera);
@@ -710,9 +1353,7 @@ void Renderer::render(Scene& scene, const Camera& camera, float deltaTime) {
 
     // ── Bloom chain ───────────────────────────────────────────────────────────
     if (settings.bloom) {
-        passBrightPass();
-        passBloomBlur();
-        passBloomComposite();
+        applyBloom(m_hdrColor, m_hdrFBO); // input = hdrColor, output = hdrFBO
     }
 
     // ── Forward transparency: glass panels ────────────────────────────────────

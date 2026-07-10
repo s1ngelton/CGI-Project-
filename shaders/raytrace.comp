@@ -1,0 +1,493 @@
+#version 430
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// ─── Output textures ──────────────────────────────────────────────
+layout(rgba32f, binding = 0) uniform image2D img;
+layout(rgba32f, binding = 1) uniform image2D reflPos;
+layout(rgba32f, binding = 2) uniform image2D reflNorm;
+
+// ─── Uniforms ──────────────────────────────────────────────────────
+uniform vec2 resolution;
+uniform vec3 camPos;
+uniform mat4 camWorld;
+uniform uint numSamples;
+uniform uint diffuseSamples = 4;
+uniform vec3 SkyColor = vec3(0.02, 0.03, 0.05);
+uniform float time;
+
+// ─── Geometry buffers ──────────────────────────────────────────────
+struct Vertex { vec4 position; vec4 normal; vec2 uv; vec4 tangent; };
+struct Mesh {
+    uint firstIndex;   // 0
+    uint indexCount;   // 4
+    uint materialIndex;// 8
+    float roughness;   // 12
+    float metallic;    // 16
+    float emissiveStrength; // 20
+    // 8‑byte padding
+    vec4 albedoColor;  // 32
+    vec4 emissiveColor;// 48
+    float ior;         // 64
+    float isExteriorGlass; // 68
+};
+layout(std430, binding = 1) readonly buffer VertexBuffer { Vertex vertices[]; };
+layout(std430, binding = 2) readonly buffer IndexBuffer  { uint indices[]; };
+layout(std430, binding = 3) readonly buffer MeshBuffer   { Mesh meshes[]; };
+
+struct EmissiveTri {
+    vec3 v0; vec3 v1; vec3 v2;
+    vec3 emission; float area; float cumArea;
+};
+
+
+layout(std430, binding = 4) readonly buffer EmissiveBuffer { EmissiveTri emissiveTris[]; };
+uniform uint emissiveCount;
+uniform float totalEmissiveArea;
+
+struct BVHNode {
+    vec3 bboxMin;
+    uint leftChild;   // 0xFFFFFFFF = leaf
+    vec3 bboxMax;
+    uint rightChild;  // leaf: start index in bvhTris
+};
+layout(std430, binding = 5) readonly buffer BVHNodeBuffer { BVHNode nodes[]; };
+layout(std430, binding = 6) readonly buffer BVHLeafCountBuffer { uint leafCounts[]; };
+layout(std430, binding = 7) readonly buffer BVHTriBuffer { uint bvhTris[]; };
+layout(std430, binding = 8) readonly buffer TriMeshBuffer { uint triMesh[]; };
+
+// ─── Utilities ──────────────────────────────────────────────────────
+uint hash(uint s) { s ^= 61u ^ (s >> 16u); s *= 9u; s ^= s >> 4u; s *= 0x27d4eb2du; s ^= s >> 15u; return s; }
+float rand(inout uint seed) { seed = hash(seed); return float(seed) / float(0xFFFFFFFFu); }
+
+struct Ray { vec3 origin; vec3 dir; };
+
+Ray generateRay(ivec2 pix, float jx, float jy) {
+    vec2 uv = (vec2(pix) + vec2(jx, jy)) / resolution;
+    uv = uv * 2.0 - 1.0; uv.x *= resolution.x / resolution.y;
+    vec3 dir = normalize((camWorld * vec4(uv, -1.0, 0.0)).xyz);
+    return Ray(camPos, dir);
+}
+
+bool intersectTriangle(Ray ray, vec3 v0, vec3 v1, vec3 v2, out float t, float tMin) {
+    vec3 e1 = v1 - v0, e2 = v2 - v0;
+    vec3 p = cross(ray.dir, e2);
+    float det = dot(e1, p);
+    if (abs(det) < 1e-6) return false;
+    float invDet = 1.0 / det;
+    vec3 s = ray.origin - v0;
+    float u = dot(s, p) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 q = cross(s, e1);
+    float v = dot(ray.dir, q) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    t = dot(e2, q) * invDet;
+    return t > tMin;
+}
+
+bool intersectAABB(Ray ray, vec3 bboxMin, vec3 bboxMax, out float tNear, out float tFar) {
+    vec3 invDir = 1.0 / ray.dir;
+    vec3 t1 = (bboxMin - ray.origin) * invDir;
+    vec3 t2 = (bboxMax - ray.origin) * invDir;
+    vec3 tMin = min(t1, t2);
+    vec3 tMax = max(t1, t2);
+    tNear = max(max(tMin.x, tMin.y), tMin.z);
+    tFar = min(min(tMax.x, tMax.y), tMax.z);
+    return tNear <= tFar && tFar > 0.0;
+}
+
+// ─── BRUTE‑FORCE traceScene (original) ────────────────────────────
+bool traceScene(Ray ray, out float hitT, out int hitMeshIndex, out int hitTriangleIndex, float tMin) {
+    hitT = 1e30;
+    bool hit = false;
+
+    uint stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0u; // root node
+
+    while (stackPtr > 0) {
+        uint nodeIdx = stack[--stackPtr];
+        BVHNode node = nodes[nodeIdx];
+
+        float tNear, tFar;
+        if (!intersectAABB(ray, node.bboxMin, node.bboxMax, tNear, tFar)) continue;
+        if (tNear > hitT) continue;
+
+        if (node.leftChild == 0xFFFFFFFFu) { // leaf
+            uint start = node.rightChild;
+            uint count = leafCounts[nodeIdx];
+            for (uint i = 0; i < count; i++) {
+                uint triIdx = bvhTris[start + i];
+                uint i0 = indices[triIdx];
+                uint i1 = indices[triIdx + 1];
+                uint i2 = indices[triIdx + 2];
+                vec3 v0 = vertices[i0].position.xyz;
+                vec3 v1 = vertices[i1].position.xyz;
+                vec3 v2 = vertices[i2].position.xyz;
+                float t;
+                if (intersectTriangle(ray, v0, v1, v2, t, tMin) && t < hitT) {
+                    hitT = t;
+                    // CRITICAL: Use triMesh to get the correct mesh index
+                    hitMeshIndex = int(triMesh[triIdx / 3]);
+                    hitTriangleIndex = int(triIdx);
+                    hit = true;
+                }
+            }
+        } else {
+            // Internal node – push children (order by tNear for better performance)
+            float tNearL, tFarL, tNearR, tFarR;
+            BVHNode leftNode = nodes[node.leftChild];
+            BVHNode rightNode = nodes[node.rightChild];
+            bool hitL = intersectAABB(ray, leftNode.bboxMin, leftNode.bboxMax, tNearL, tFarL);
+            bool hitR = intersectAABB(ray, rightNode.bboxMin, rightNode.bboxMax, tNearR, tFarR);
+            if (hitL && hitR) {
+                if (tNearL < tNearR) {
+                    stack[stackPtr++] = node.rightChild;
+                    stack[stackPtr++] = node.leftChild;
+                } else {
+                    stack[stackPtr++] = node.leftChild;
+                    stack[stackPtr++] = node.rightChild;
+                }
+            } else if (hitL) {
+                stack[stackPtr++] = node.leftChild;
+            } else if (hitR) {
+                stack[stackPtr++] = node.rightChild;
+            }
+        }
+    }
+    return hit;
+}
+
+// ─── Rest of the shader (computeNormal, sampling, BRDF, trace, main) unchanged ───
+vec3 computeNormal(int hitTriangleIndex, Ray ray) {
+    uint i0 = indices[hitTriangleIndex], i1 = indices[hitTriangleIndex+1], i2 = indices[hitTriangleIndex+2];
+    vec3 p0 = vertices[i0].position.xyz, p1 = vertices[i1].position.xyz, p2 = vertices[i2].position.xyz;
+    vec3 n = cross(p1 - p0, p2 - p0);
+    if (dot(n, ray.dir) > 0.0) n = -n;
+    return normalize(n);
+}
+
+vec3 sampleCosineWeightedHemisphere(vec3 N, inout uint seed) {
+    float u1 = rand(seed), u2 = rand(seed);
+    float phi = 2.0 * 3.14159265 * u1;
+    float cosTheta = sqrt(1.0 - u2);
+    float sinTheta = sqrt(u2);
+    vec3 up = abs(N.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    return normalize(T * (cos(phi) * sinTheta) + B * (sin(phi) * sinTheta) + N * cosTheta);
+}
+
+void sampleEmissiveTriangle(inout uint seed, out vec3 lightPoint, out vec3 lightNormal, out vec3 Le, out float pdf) {
+    if (emissiveCount == 0u) { Le = vec3(0.0); pdf = 1.0; return; }
+    float u = rand(seed) * totalEmissiveArea;
+    int lo = 0, hi = int(emissiveCount) - 1;
+    while (lo < hi) { int mid = (lo + hi) / 2; if (emissiveTris[mid].cumArea < u) lo = mid + 1; else hi = mid; }
+    EmissiveTri tri = emissiveTris[lo];
+    float r1 = rand(seed), r2 = rand(seed);
+    if (r1 + r2 > 1.0) { r1 = 1.0 - r1; r2 = 1.0 - r2; }
+    lightPoint = tri.v0 + r1 * (tri.v1 - tri.v0) + r2 * (tri.v2 - tri.v0);
+    lightNormal = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+    Le = tri.emission;
+    pdf = 1.0 / totalEmissiveArea;
+}
+
+const int MAX_DEPTH = 8;
+const float PI = 3.14159265;
+
+// ─── BRDF helpers ──────────────────────────────────────────────────
+float GGX_D(float NdotH, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
+    return alpha2 / (PI * denom * denom);
+}
+float GGX_G1(float NdotV, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float k = alpha / 2.0;
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+float GGX_G(float NdotV, float NdotL, float roughness) {
+    return GGX_G1(NdotV, roughness) * GGX_G1(NdotL, roughness);
+}
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+vec3 sampleGGX(vec3 N, float roughness, inout uint seed) {
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+    float alpha = roughness * roughness;
+    float theta = atan(alpha * sqrt(r1) / sqrt(max(1.0 - r1, 1e-6)));
+    float phi = 2.0 * PI * r2;
+    float sinTheta = sin(theta);
+    float cosTheta = cos(theta);
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    vec3 H_local = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+    return T * H_local.x + B * H_local.y + N * H_local.z;
+}
+
+// ─── Shadow ray helper ─────────────────────────────────────────────
+bool traceShadow(Ray ray, float maxDist) {
+    float t; int dummyMesh, dummyTri;
+    return traceScene(ray, t, dummyMesh, dummyTri, 0.0001) && t < maxDist - 0.001;
+}
+
+// ─── Direct lighting (with MIS) ────────────────────────────────────
+vec3 computeDirectLighting(
+    vec3 hitPos, vec3 normal, vec3 wo, Mesh material,
+    inout uint seed
+) {
+    vec3 direct = vec3(0.0);
+    vec3 albedo = material.albedoColor.rgb;
+    float roughness = material.roughness;
+    float metallic = material.metallic;
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 diffuseColor = (1.0 - metallic) * albedo;
+
+    uint totalSamples = diffuseSamples;
+    if (totalSamples == 0) return vec3(0.0);
+    uint lightSamples = totalSamples / 2;
+    uint bsdfSamples = totalSamples - lightSamples;
+
+    // Light sampling
+    for (uint i = 0; i < lightSamples; i++) {
+        vec3 lightPoint, lightNormal, Le; float pdf_light;
+        sampleEmissiveTriangle(seed, lightPoint, lightNormal, Le, pdf_light);
+        if (Le == vec3(0.0) || pdf_light == 0.0) continue;
+        vec3 L = lightPoint - hitPos;
+        float dist = length(L);
+        vec3 wi = normalize(L);
+        if (traceShadow(Ray(hitPos + normal * 0.001, wi), dist)) continue;
+        float NdotL = max(dot(normal, wi), 0.0);
+        float NdotV = max(dot(normal, wo), 0.0);
+        if (NdotL <= 0.0 || NdotV <= 0.0) continue;
+        vec3 diffuseBRDF = diffuseColor / PI;
+        vec3 H = normalize(wi + wo);
+        float NdotH = max(dot(normal, H), 0.0);
+        float VdotH = max(dot(wo, H), 0.0);
+        float D = GGX_D(NdotH, roughness);
+        float G = GGX_G(NdotV, NdotL, roughness);
+        vec3 F = fresnelSchlick(VdotH, F0);
+        vec3 specularBRDF = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-6);
+        vec3 brdf = diffuseBRDF + specularBRDF;
+        float cosLight = abs(dot(lightNormal, -wi));
+        float G_geom = (NdotL * cosLight) / max(dist * dist, 0.001);
+        G_geom = min(G_geom, 100.0);
+        float pdf_bsdf = max(NdotL, 0.0) / PI;
+        float weight_light = (pdf_light * pdf_light) / (pdf_light * pdf_light + pdf_bsdf * pdf_bsdf);
+        weight_light = min(weight_light, 10.0);
+        direct += brdf * Le * G_geom * weight_light / pdf_light;
+    }
+
+    // BSDF sampling for direct light
+    for (uint i = 0; i < bsdfSamples; i++) {
+        vec3 wi;
+        float pdf_bsdf;
+        vec3 brdf;
+        float NdotV = max(dot(normal, wo), 0.0);
+        if (rand(seed) < metallic) {
+            vec3 H = sampleGGX(normal, roughness, seed);
+            wi = normalize(reflect(-wo, H));
+            float NdotL = max(dot(normal, wi), 0.0);
+            float NdotH = max(dot(normal, H), 0.0);
+            float VdotH = max(dot(wo, H), 0.0);
+            if (NdotL > 0.0 && NdotV > 0.0) {
+                float D = GGX_D(NdotH, roughness);
+                float G = GGX_G(NdotV, NdotL, roughness);
+                vec3 F = fresnelSchlick(VdotH, F0);
+                vec3 specBRDF = (D * G * F) / (4.0 * NdotV * NdotL);
+                float pdf = D * NdotH / (4.0 * VdotH);
+                if (pdf > 0.0) {
+                    brdf = specBRDF;
+                    pdf_bsdf = pdf;
+                } else continue;
+            } else continue;
+        } else {
+            wi = sampleCosineWeightedHemisphere(normal, seed);
+            float NdotL = max(dot(normal, wi), 0.0);
+            if (NdotL <= 0.0) continue;
+            pdf_bsdf = NdotL / PI;
+            brdf = diffuseColor / PI;
+        }
+        Ray bounceRay = Ray(hitPos + normal * 0.001, wi);
+        float t; int hitMesh, hitTri;
+        if (traceScene(bounceRay, t, hitMesh, hitTri, 0.0001)) {
+            Mesh hitMat = meshes[hitMesh];
+            if (hitMat.emissiveStrength > 0.0) {
+                vec3 Le = hitMat.emissiveColor.rgb * hitMat.emissiveStrength;
+                vec3 lightNormal = computeNormal(hitTri, bounceRay);
+                float dist = t;
+                float cosLight = abs(dot(lightNormal, -wi));
+                float G_geom = cosLight / max(dist * dist, 0.001);
+                G_geom = min(G_geom, 100.0);
+                float pdf_light = 1.0 / totalEmissiveArea;
+                float weight_bsdf = (pdf_bsdf * pdf_bsdf) / (pdf_light * pdf_light + pdf_bsdf * pdf_bsdf);
+                weight_bsdf = min(weight_bsdf, 10.0);
+                direct += brdf * Le * G_geom * weight_bsdf / pdf_bsdf;
+            }
+        }
+    }
+    return direct / float(diffuseSamples);
+}
+
+// ─── BSDF sampling ──────────────────────────────────────────────────
+struct BSDFResult {
+    Ray ray;
+    vec3 factor;
+};
+
+BSDFResult sampleBSDF(vec3 hitPos, vec3 normal, vec3 wo, Mesh material, inout uint seed) {
+    BSDFResult result;
+    float metallic = material.metallic;
+    float roughness = material.roughness;
+    vec3 albedo = material.albedoColor.rgb;
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 diffuseColor = (1.0 - metallic) * albedo;
+
+    if (metallic >= 0.999 && roughness <= 0.001) {
+        vec3 wi = reflect(-wo, normal);
+        result.factor = vec3(1.0);
+        result.ray = Ray(hitPos + normal * 0.001, wi);
+        return result;
+    }
+
+    if (rand(seed) < metallic) {
+        vec3 H = sampleGGX(normal, roughness, seed);
+        vec3 wi = normalize(reflect(-wo, H));
+        float NdotL = max(dot(normal, wi), 0.0);
+        float NdotV = max(dot(normal, wo), 0.0);
+        float NdotH = max(dot(normal, H), 0.0);
+        float VdotH = max(dot(wo, H), 0.0);
+        if (NdotL > 0.0 && NdotV > 0.0) {
+            float D = GGX_D(NdotH, roughness);
+            float G = GGX_G(NdotV, NdotL, roughness);
+            vec3 F = fresnelSchlick(VdotH, F0);
+            vec3 specBRDF = (D * G * F) / (4.0 * NdotV * NdotL);
+            float pdf = D * NdotH / (4.0 * VdotH);
+            if (pdf > 0.0) {
+                result.factor = specBRDF * NdotL / pdf;
+                result.ray = Ray(hitPos + normal * 0.001, wi);
+                return result;
+            }
+        }
+        result.ray = Ray(hitPos + normal * 0.001, reflect(-wo, normal));
+        result.factor = vec3(0.0);
+        return result;
+    } else {
+        vec3 wi = sampleCosineWeightedHemisphere(normal, seed);
+        float NdotL = max(dot(normal, wi), 0.0);
+        if (NdotL <= 0.0) {
+            result.factor = vec3(0.0);
+            result.ray = Ray(hitPos + normal * 0.001, wi);
+            return result;
+        }
+        float pdf = NdotL / PI;
+        vec3 diffuseBRDF = diffuseColor / PI;
+        result.factor = diffuseBRDF * NdotL / pdf;
+        result.ray = Ray(hitPos + normal * 0.001, wi);
+        return result;
+    }
+}
+
+// ─── Main trace function ───────────────────────────────────────────
+vec3 trace(Ray firstRay, inout uint seed, out vec3 outHitPos, out vec3 outHitNormal) {
+    vec3 color = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    Ray ray = firstRay;
+
+    outHitPos = vec3(0.0);
+    outHitNormal = vec3(0.0, 1.0, 0.0);
+
+    for (int depth = 0; depth < MAX_DEPTH; depth++) {
+        float t; int hitMeshIndex, hitTriangleIndex;
+        if (!traceScene(ray, t, hitMeshIndex, hitTriangleIndex, 0.0001)) {
+            color += throughput * SkyColor;
+            break;
+        }
+
+        vec3 hitPos = ray.origin + ray.dir * t;
+        Mesh material = meshes[hitMeshIndex];
+        vec3 normal = computeNormal(hitTriangleIndex, ray);
+        vec3 wo = -ray.dir;
+
+        if (material.emissiveStrength > 0.0) {
+            color += throughput * material.emissiveColor.rgb * material.emissiveStrength;
+            break;
+        }
+
+        if (material.albedoColor.rgb == vec3(0.0))
+            material.albedoColor.rgb = vec3(0.7, 0.7, 0.7);
+
+        bool isGlass = (material.ior > 1.0);
+
+        // ---------- GLASS (one‑sided using CPU vertex normal) ----------
+        if (isGlass) {
+            uint i0 = indices[hitTriangleIndex];
+            vec3 geomNormal = vertices[i0].normal.xyz;
+            float side = dot(ray.dir, geomNormal);
+
+            float cosTheta = max(dot(normal, wo), 0.0);
+            float F0 = ((material.ior - 1.0) / (material.ior + 1.0));
+            F0 = F0 * F0;
+            float R = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+            R = min(R, 0.9999);
+
+            if (side < 0.0) {
+                color += throughput * (1.0 - R) * SkyColor;
+                throughput *= R;
+                material.metallic = 1.0;
+                material.roughness = 0.0;
+                // FALL THROUGH to opaque branch
+            } else {
+                throughput *= (1.0 - R);
+                ray = Ray(hitPos + ray.dir * 0.001, ray.dir);
+                continue;
+            }
+        }
+
+        // ---------- OPAQUE ----------
+        if (!isGlass) {
+            outHitPos = hitPos;
+            outHitNormal = normal;
+        }
+
+        if (!isGlass) {
+            vec3 direct = computeDirectLighting(hitPos, normal, wo, material, seed);
+            color += throughput * direct;
+        }
+
+        BSDFResult bsdfResult = sampleBSDF(hitPos, normal, wo, material, seed);
+        if (bsdfResult.factor == vec3(0.0)) break;
+        throughput *= bsdfResult.factor;
+        ray = bsdfResult.ray;
+
+    }
+    return color;
+}
+
+// ─── Main ──────────────────────────────────────────────────────────
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(resolution.x) || pix.y >= int(resolution.y)) return;
+
+    vec3 accumulated = vec3(0.0);
+    uint baseSeed = uint(pix.x * 1973u + pix.y * 9277u + uint(time * 1000.0));
+
+    for (uint s = 0u; s < numSamples; ++s) {
+        uint seed = baseSeed + s * 719393u;
+        float jx = rand(seed), jy = rand(seed);
+        Ray ray = generateRay(pix, jx, jy);
+        vec3 hitPos, hitNormal;
+        accumulated += trace(ray, seed, hitPos, hitNormal);
+        if (s == numSamples - 1) {
+            imageStore(reflPos, pix, vec4(hitPos, 0.0));
+            imageStore(reflNorm, pix, vec4(hitNormal, 0.0));
+        }
+    }
+
+    vec3 finalColor = accumulated / float(numSamples);
+    imageStore(img, pix, vec4(finalColor, 1.0));
+}

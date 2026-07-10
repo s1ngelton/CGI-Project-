@@ -2,13 +2,15 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 
+
 // ─── Procedural box builder ───────────────────────────────────────────────────
 static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
                     glm::vec3 albedo,
                     glm::vec3 emissive      = glm::vec3(0.0f),
                     float     emissStrength = 0.0f,
                     float     roughness     = 0.5f,
-                    float     metallic      = 0.0f)
+                    float     metallic      = 0.0f,
+                    float     IOR           = 1.0f)
 {
     struct Face { glm::vec3 n; glm::vec3 v[4]; };
 
@@ -34,8 +36,8 @@ static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
         auto base = (unsigned int)verts.size();
         for (int i = 0; i < 4; ++i) {
             Vertex vt;
-            vt.Position  = f.v[i];
-            vt.Normal    = f.n;
+            vt.Position  = glm::vec4(f.v[i], 0.0);
+            vt.Normal    = glm::vec4(f.n, 0.0);
             vt.TexCoords = glm::vec2(0.0f);
             verts.push_back(vt);
         }
@@ -47,6 +49,55 @@ static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
     m.emissiveStrength = emissStrength;
     m.roughness        = roughness;
     m.metallic         = metallic;
+    m.IOR              = IOR;
+    return m;
+}
+
+static Mesh makeQuad(glm::vec2 lo, glm::vec2 hi, float z, int dim, int dir,
+                    glm::vec3 albedo,
+                    glm::vec3 emissive      = glm::vec3(0.0f),
+                    float     emissStrength = 0.0f,
+                    float     roughness     = 0.5f,
+                    float     metallic      = 0.0f,
+                    float     IOR           = 1.0f)
+{
+    struct Face { glm::vec3 n; glm::vec3 v[4]; };
+
+    float lx = lo.x, hx = hi.x;
+    float ly = lo.y, hy = hi.y;
+    Face faces[1] = {
+        { { 0, 0, dir}, { {hx,ly,z},{lx,ly,z},{lx,hy,z},{hx,hy,z} } },
+        };
+    if (dim == 1){
+        faces[0] = { { dir, 0, 0}, { {z, hx,ly},{z,lx, ly},{z , lx,hy},{z,hx,hy} } };
+    } else if (dim == 2){
+        faces[0] = { { 0, dir, 0}, { {hx,z,ly},{lx,z,ly},{lx,z,hy},{hx,z,hy} } };
+    } 
+    
+
+    std::vector<Vertex>       verts;
+    std::vector<unsigned int> idx;
+    verts.reserve(24);
+    idx.reserve(36);
+
+    for (auto& f : faces) {
+        auto base = (unsigned int)verts.size();
+        for (int i = 0; i < 4; ++i) {
+            Vertex vt;
+            vt.Position  = glm::vec4(f.v[i], 0.0);
+            vt.Normal    = glm::vec4(f.n, 0.0);
+            vt.TexCoords = glm::vec2(0.0f);
+            verts.push_back(vt);
+        }
+        idx.insert(idx.end(), {base,base+1,base+2, base,base+2,base+3});
+    }
+
+    Mesh m(std::move(verts), std::move(idx), 0, albedo);
+    m.emissiveColor    = emissive;
+    m.emissiveStrength = emissStrength;
+    m.roughness        = roughness;
+    m.metallic         = metallic;
+    m.IOR              = IOR;
     return m;
 }
 
@@ -55,19 +106,43 @@ static SceneObject boxObj(glm::vec3 lo, glm::vec3 hi,
                           glm::vec3 emissive      = glm::vec3(0.0f),
                           float     emissStrength = 0.0f,
                           float     roughness     = 0.5f,
-                          float     metallic      = 0.0f)
+                          float     metallic      = 0.0f,
+                          float     IOR           = 1.0f)
 {
     SceneObject o;
-    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength, roughness, metallic));
+    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength, roughness, metallic, IOR));
     return o;
 }
 
+static SceneObject quadObj(glm::vec2 lo, glm::vec2 hi, float z, int dim,
+                          glm::vec3 albedo,
+                          glm::vec3 emissive      = glm::vec3(0.0f),
+                          float     emissStrength = 0.0f,
+                          float     roughness     = 0.5f,
+                          float     metallic      = 0.0f,
+                          float     IOR = 1.0f)
+{
+    SceneObject o;
+    o.model.addMesh(makeQuad(lo, hi, z, dim, 1, albedo, emissive, emissStrength, roughness, metallic, IOR));
+    return o;
+}
 // Build a glass panel SceneObject with its world-space sortCenter set.
-static SceneObject glassPanel(glm::vec3 lo, glm::vec3 hi) {
+static SceneObject glassPanel(glm::vec2 lo, glm::vec2 hi, float z, int dim, int dir) {
+    const glm::vec3 PanelAlb  {0.f, 0.f, 0.f};
+    const float     PanelRough = 0.00f;
+    const float     PanelMetal = 0.5f;
+    const float     PanelIOR = 1.5f;
+
     // Glass meshes have no diffuse/PBR maps — the glass shader handles shading itself.
     SceneObject o;
-    o.model.addMesh(makeBox(lo, hi, glm::vec3(0.0f)));  // albedo unused by glass shader
-    o.sortCenter = (lo + hi) * 0.5f;
+    o.model.addMesh(makeQuad(lo, hi, z, dim, dir, PanelAlb, glm::vec3(0.0), 0.0, PanelRough, PanelMetal, PanelIOR));  // albedo unused by glass shader
+    if (dim == 1){
+        o.sortCenter = glm::vec3(z, 0.5f*(lo[0]+hi[0]), 0.5f*(lo[1]+hi[1]));
+    } else if (dim == 2){
+        o.sortCenter = glm::vec3(0.5f*(lo[0]+hi[0]), z,  0.5f*(lo[1]+hi[1]));
+    } else if (dim == 3){
+        o.sortCenter = glm::vec3(0.5f*(lo[0]+hi[0]), 0.5f*(lo[1]+hi[1]), z);
+    }
     return o;
 }
 
@@ -81,7 +156,7 @@ void Scene::load(const std::string& /*path*/) {
     // Brushed dark metal — used for all structural frame elements
     const glm::vec3 kFrameAlb  {0.06f, 0.06f, 0.07f};
     const float     kFrameRough = 0.30f;
-    const float     kFrameMetal = 1.00f;
+    const float     kFrameMetal = 0.1f;
     // No emissive — frame is dark, illuminated only by ceiling lights
 
     const glm::vec3 kCeilEmit  {1.00f, 0.97f, 0.90f};   // warm white ceiling glow
@@ -94,7 +169,7 @@ void Scene::load(const std::string& /*path*/) {
 
     // ── 2. Room floor (lit from above — no self-emission) ─────────────────────
     objects.push_back(boxObj(
-        {-3.0f, 0.0f, -2.0f}, {3.0f, 0.005f, 2.0f},
+        {-3.0f, 0.0f, -2.0f}, {3.0f, 0.02f, 2.0f},
         {0.15f, 0.10f, 0.08f},
         glm::vec3(0.0f), 0.0f, 0.6f, 0.0f));
     objects.back().skipReflection = true;
@@ -128,27 +203,27 @@ void Scene::load(const std::string& /*path*/) {
 
     // ── 7. Ceiling light panel ────────────────────────────────────────────────
     // emissiveStrength 5.0 → well above bloom threshold, strong warm-white glow
-    objects.push_back(boxObj(
-        {-2.7f, 2.93f, -1.7f}, {2.7f, 2.95f, 1.7f},
+    objects.push_back(quadObj(
+        {-1.f+H, -1.f+H}, {1.f-H, 1.f-H}, 3.f-2*H, 2,
         {1.0f, 1.0f, 1.0f},
-        kCeilEmit, 5.0f));
+        kCeilEmit, 100.0f));
 
     // ── 8. Glass panels (forward transparent pass, not in G-buffer) ───────────
     // Panes are 2 mm thick, centred in the plane of each wall.
     // Front wall (Z = +2): 4 bays between corner posts and mullions
-    glassObjects.push_back(glassPanel({-2.96f, H, 1.999f}, {-1.54f, 3.f-H, 2.001f}));
-    glassObjects.push_back(glassPanel({-1.46f, H, 1.999f}, {-0.04f, 3.f-H, 2.001f}));
-    glassObjects.push_back(glassPanel({ 0.04f, H, 1.999f}, { 1.46f, 3.f-H, 2.001f}));
-    glassObjects.push_back(glassPanel({ 1.54f, H, 1.999f}, { 2.96f, 3.f-H, 2.001f}));
+    glassObjects.push_back(glassPanel({-2.96f, H}, {-1.54f, 3.f-H}, 2.0f, 3, -1));
+    glassObjects.push_back(glassPanel({-1.46f, H}, {-0.04f, 3.f-H}, 2.0f, 3, -1));
+    glassObjects.push_back(glassPanel({ 0.04f, H}, { 1.46f, 3.f-H}, 2.0f, 3, -1));
+    glassObjects.push_back(glassPanel({ 1.54f, H}, { 2.96f, 3.f-H}, 2.0f, 3, -1));
 
     // Back wall (Z = -2): one full-width pane
-    glassObjects.push_back(glassPanel({-2.96f, H, -2.001f}, {2.96f, 3.f-H, -1.999f}));
+    glassObjects.push_back(glassPanel({-2.96f, H}, {2.96f, 3.f-H}, -2.0f, 3, 1));
 
     // Left wall (X = -3): one full-depth pane
-    glassObjects.push_back(glassPanel({-3.001f, H, -1.96f}, {-2.999f, 3.f-H, 1.96f}));
+    glassObjects.push_back(glassPanel({H, -1.96f}, {3.f-H, 1.96f}, -3.0f, 1, 1));
 
     // Right wall (X = +3): one full-depth pane
-    glassObjects.push_back(glassPanel({ 2.999f, H, -1.96f}, { 3.001f, 3.f-H, 1.96f}));
+    glassObjects.push_back(glassPanel({H, -1.96f}, {3.f-H, 1.96f}, 3.0f, 1, -1));
 }
 
 // ─── Scene::draw ─────────────────────────────────────────────────────────────
@@ -158,6 +233,7 @@ void Scene::draw(Shader& shader) const {
         obj.model.draw(shader);
     }
 }
+
 
 // ─── Scene::drawForReflection ─────────────────────────────────────────────────
 void Scene::drawForReflection(Shader& shader) const {

@@ -11,6 +11,7 @@
 
 #include "Camera.h"
 #include "Shader.h"
+#include "ComputeShader.h"
 #include "Model.h"
 #include "Renderer.h"
 #include "Scene.h"
@@ -25,12 +26,13 @@ constexpr int SCR_HEIGHT = 1080;
 const char*   TITLE      = "Horror Engine";
 
 // ─── Global state ───────────────────────────────────────────────────────────
-Camera camera(glm::vec3(0.0f, 1.35f, 9.5f));
+Camera camera(glm::vec3(-2.5f, 1.5f, -1.5f));
 float  lastX      = SCR_WIDTH  / 2.0f;
 float  lastY      = SCR_HEIGHT / 2.0f;
 bool   firstMouse = true;
 float  deltaTime  = 0.0f;
 float  lastFrame  = 0.0f;
+float  currentFrame = 0.0f;
 
 // Interactive toggles (ImGui / keyboard)
 bool  enableShadows    = true;
@@ -40,20 +42,21 @@ bool  enableDOF        = true;
 bool  enableMotionBlur = true;
 bool  cinematicMode    = false;   // true = play cinematic, false = free camera
 bool  uiMode           = false;   // Tab: unlock cursor so ImGui is clickable
+bool  saveImage        = true;
 
 // Tonemap / HDR controls
 float globalExposure  = 1.0f;
 int   globalTonemapOp = 0;        // 0 = ACES, 1 = Reinhard
 
 // Bloom controls
-bool  enableBloom      = false;
+bool  enableBloom      = true;
 float bloomThreshold   = 1.0f;
-float bloomKnee        = 0.5f;
-int   bloomIterations  = 5;
-float bloomIntensity   = 0.6f;
+float bloomKnee        = 0.75f;
+int   bloomIterations  = 1;
+float bloomIntensity   = 0.1f;
 
 // Color grade + vignette
-bool  gradeEnable      = false;
+bool  gradeEnable      = true;
 float temperature      = 0.0f;
 float gradeTint[3]     = {1.0f, 1.0f, 1.0f};
 float saturation       = 1.0f;
@@ -65,6 +68,15 @@ float vignetteSoftness = 0.45f;
 bool  enableReflection  = false;
 float reflectivity      = 0.25f;
 float glossyBlur        = 0.0f;
+
+//Raytracing Config
+int numSamples = 128;
+int lightSamples = 1; //Keep at 1, raising numSamples is better
+
+//Denoising Config
+float sigmaColor = 0.5f;
+float sigmaNormal = 0.1f;
+float sigmaDepth = 5.0f;
 
 // Chair pose — live-adjust because free models have unpredictable scale/origin
 float chairPosX  =  0.3f;
@@ -132,65 +144,19 @@ void processMovement(GLFWwindow* window) {
         globalExposure = glm::min(20.0f, globalExposure + kExpSpeed * deltaTime);
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
-int main() {
-    // ── Init GLFW ──────────────────────────────────────────────────────────
-    glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);   // 4.1 = Mac compatible
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-#ifdef __APPLE__
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-#endif
-
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, TITLE, nullptr, nullptr);
-    if (!window) {
-        std::cerr << "Failed to create GLFW window\n";
-        glfwTerminate();
-        return -1;
-    }
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window,       mouse_callback);
-    glfwSetScrollCallback(window,          scroll_callback);
-    glfwSetKeyCallback(window,             key_callback);
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-
-    // ── Load OpenGL via GLAD ───────────────────────────────────────────────
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "Failed to initialize GLAD\n";
-        return -1;
-    }
-    std::cout << "OpenGL " << glGetString(GL_VERSION)
-              << " | " << glGetString(GL_RENDERER) << "\n";
+void SetupScene(Scene& scene, CinematicEngine& cinematic, AudioManager& audio, Renderer& renderer, Camera& camera){
 
     // "Control" room camera — 35 mm lens, straight-on, centered
-    camera.Yaw   = -90.0f;    // look in -Z toward room
-    camera.Pitch = -0.30f;    // look-at (0,1.30,0) from (0,1.35,9.5)
+    camera.Yaw   = 45.0f;    // look in -Z toward room
+    camera.Pitch = -10.0f;    // look-at (0,1.30,0) from (0,1.35,9.5)
     camera.Zoom  = 35.0f;
     camera.ProcessMouseMovement(0.0f, 0.0f);   // commit Yaw/Pitch to Front vector
-
-    glEnable(GL_DEPTH_TEST);
-
-    // ── ImGui ──────────────────────────────────────────────────────────────
-#ifdef HAS_IMGUI
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::StyleColorsDark();
-    ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 410");
-#endif
-
-    // ── Scene setup ────────────────────────────────────────────────────────
-    Renderer        renderer(SCR_WIDTH, SCR_HEIGHT);
-    glfwSetWindowUserPointer(window, &renderer);   // lets resize callback reach renderer
-    Scene           scene;
-    CinematicEngine cinematic;
-    AudioManager    audio;
 
     scene.load("assets/scene.json");       // loads models, lights, etc.
     cinematic.load("assets/cameras.json"); // keyframe data for camera paths
     audio.load("assets/audio.json");       // sound cues
+
+    
 
     // ── Chair prop ─────────────────────────────────────────────────────────
     // Drop your .obj (+ .mtl + textures) into assets/models/.
@@ -218,22 +184,12 @@ int main() {
     }
 
     scene.objects.push_back(std::move(chairObj));
-    const int kChairIdx = (int)scene.objects.size() - 1;
 
-    // ── Render loop ────────────────────────────────────────────────────────
-    while (!glfwWindowShouldClose(window)) {
-        float currentFrame = static_cast<float>(glfwGetTime());
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
+    renderer.LoadScene(scene);
+}
 
-        processMovement(window);
-
-        // Cinematic camera overrides free camera when playing
-        if (cinematicMode) {
-            cinematic.update(currentFrame, camera);
-        }
-
-        // Renderer settings driven by interactive toggles
+void RenderConfiguration(Renderer& renderer) {
+            // Renderer settings driven by interactive toggles
         renderer.settings.shadows    = enableShadows;
         renderer.settings.softShadow = enableSoftShadow;
         renderer.settings.ao         = enableAO;
@@ -259,6 +215,110 @@ int main() {
         renderer.settings.reflectivity = reflectivity;
         renderer.settings.glossyBlur   = glossyBlur;
 
+        renderer.settings.numSamples = numSamples;
+        renderer.settings.lightSamples = lightSamples;
+
+        renderer.settings.sigmaColor = sigmaColor;
+        renderer.settings.sigmaNormal = sigmaNormal;
+        renderer.settings.sigmaDepth = sigmaDepth;
+
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+int main() {
+   
+    // ── Init GLFW ──────────────────────────────────────────────────────────
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);   // 4.1 = Mac compatible
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, TITLE, nullptr, nullptr);
+    if (!window) {
+        std::cerr << "Failed to create GLFW window\n";
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetCursorPosCallback(window,       mouse_callback);
+    glfwSetScrollCallback(window,          scroll_callback);
+    glfwSetKeyCallback(window,             key_callback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+    // ── Load OpenGL via GLAD ───────────────────────────────────────────────
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "Failed to initialize GLAD\n";
+        return -1;
+    }
+    std::cout << "OpenGL " << glGetString(GL_VERSION)
+              << " | " << glGetString(GL_RENDERER) << "\n";
+
+
+    glEnable(GL_DEPTH_TEST);
+
+    if (saveImage) {
+
+        Scene scene;
+        CinematicEngine cinematic;
+        AudioManager audio;
+        Renderer renderer(SCR_WIDTH, SCR_HEIGHT);
+
+        SetupScene(scene, cinematic, audio, renderer, camera);
+
+        const int kChairIdx = (int)scene.objects.size() - 1;
+        RenderConfiguration(renderer);
+
+        // rebuild chair transform...
+        renderer.renderRaytracing(scene, camera, deltaTime, currentFrame);
+
+        glFinish();
+
+        renderer.saveRayTracingImage("NoisyImage.png");
+        renderer.saveFinalImage("ProcessedImage.png");
+        std::cout << "saveImage completed" << std::endl;
+        return 0;
+}
+
+    // ── ImGui ──────────────────────────────────────────────────────────────
+#ifdef HAS_IMGUI
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 410");
+#endif
+
+    // ── Scene setup ────────────────────────────────────────────────────────
+    
+    Scene           scene;
+    CinematicEngine cinematic;
+    AudioManager    audio;
+    Renderer        renderer(SCR_WIDTH, SCR_HEIGHT);
+    glfwSetWindowUserPointer(window, &renderer);   // lets resize callback reach renderer
+
+    SetupScene(scene, cinematic, audio, renderer, camera);
+
+    const int kChairIdx = (int)scene.objects.size() - 1;
+
+    // ── Render loop ────────────────────────────────────────────────────────
+    while (!glfwWindowShouldClose(window)) {
+        float currentFrame = static_cast<float>(glfwGetTime());
+        deltaTime = currentFrame - lastFrame;
+        lastFrame = currentFrame;
+
+        processMovement(window);
+
+        // Cinematic camera overrides free camera when playing
+        if (cinematicMode) {
+            cinematic.update(currentFrame, camera);
+        }
+        RenderConfiguration(renderer);
+
+
         // Rebuild chair transform from sliders each frame
         {
             glm::mat4 T = glm::translate(glm::mat4(1.0f),
@@ -270,7 +330,7 @@ int main() {
             scene.objects[kChairIdx].transform = T * R * S;
         }
 
-        renderer.render(scene, camera, deltaTime);
+        renderer.renderRasterizer(scene, camera, deltaTime, currentFrame);
 
         // ── ImGui overlay ─────────────────────────────────────────────────
 #ifdef HAS_IMGUI

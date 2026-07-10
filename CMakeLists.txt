@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(HorrorEngine VERSION 1.0)
+set(CMAKE_VERBOSE_MAKEFILE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,7 +24,7 @@ target_include_directories(glad PUBLIC external/glad/include)
 # ─────────────────────────────────────────────
 find_package(glfw3  REQUIRED)
 find_package(glm    REQUIRED)
-find_package(assimp REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 
 # OpenAL — name differs slightly per platform
 find_package(OpenAL QUIET)
@@ -80,14 +82,20 @@ set(ENGINE_SOURCES
 
 add_executable(HorrorEngine ${ENGINE_SOURCES})
 
+
 # ─────────────────────────────────────────────
 #  Include paths
 # ─────────────────────────────────────────────
 target_include_directories(HorrorEngine PRIVATE
+    ${CMAKE_SOURCE_DIR}/external/glad/include
+)
+target_include_directories(HorrorEngine PRIVATE
     include
     external/glad/include
     external/stb
+    external
 )
+
 
 # ─────────────────────────────────────────────
 #  Link libraries
