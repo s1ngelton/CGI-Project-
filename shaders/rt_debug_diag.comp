@@ -1,0 +1,184 @@
+#version 430 core
+// Diagnostic-only shader: walks the primary ray for ONE target pixel, following
+// glass TRANSMISSION only (matches RayTracer::debugTraceOpaqueViaGlassPassThrough
+// on the CPU side exactly), and writes hit identity + shading inputs to a small
+// SSBO for direct CPU/GPU comparison. Does not touch rt_cp4_glass.comp.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct BVHNode {
+    float bminX, bminY, bminZ;
+    float bmaxX, bmaxY, bmaxZ;
+    int   flag;
+    int   axis;
+    uint  data0;
+    uint  data1;
+};
+
+layout(std430, binding = 0) readonly buffer NodesBuf   { BVHNode nodes[]; };
+layout(std430, binding = 1) readonly buffer IndicesBuf { uint    indices[]; };
+layout(std430, binding = 2) readonly buffer VertsBuf   { float   verts[]; };
+layout(std430, binding = 3) readonly buffer NormalsBuf { float   norms[]; };
+layout(std430, binding = 7) readonly buffer TriFlagsBuf { uint   triFlags[]; };
+
+layout(std430, binding = 12) writeonly buffer DebugOut { float dbg[21]; };
+
+// Measurement-only: tracks the worst-case simultaneous BVH traversal stack
+// occupancy seen by this invocation, across all traverseBVH() calls (the
+// pass-through loop can call it multiple times for one pixel).
+int gMaxSp = 0;
+int gTraverseCalls = 0;
+
+uniform vec3  uCamPos;
+uniform vec3  uCamFront;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform float uAspect;
+uniform float uTanHalfFov;
+uniform int   uWidth;
+uniform int   uHeight;
+uniform int   uTargetPx;
+uniform int   uTargetPy;
+
+uniform int   uNumLights;
+uniform vec3  uLightPos[4];
+
+#define MAX_STACK 160
+#define RAY_MIN_T 0.001
+#define RAY_MAX_T 1.0e30
+
+vec3 triVert(uint triIdx, uint which) {
+    uint base = triIdx * 9u + which * 3u;
+    return vec3(verts[base + 0u], verts[base + 1u], verts[base + 2u]);
+}
+vec3 triNorm(uint triIdx, uint which) {
+    uint base = triIdx * 9u + which * 3u;
+    return vec3(norms[base + 0u], norms[base + 1u], norms[base + 2u]);
+}
+
+vec3 safeInv(vec3 v) {
+    vec3 s = vec3(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0, v.z >= 0.0 ? 1.0 : -1.0);
+    vec3 av = abs(v);
+    const float kEps = 1e-12;
+    return vec3(
+        1.0 / (av.x < kEps ? kEps * s.x : v.x),
+        1.0 / (av.y < kEps ? kEps * s.y : v.y),
+        1.0 / (av.z < kEps ? kEps * s.z : v.z)
+    );
+}
+
+bool intersectTriV(vec3 ro, vec3 rd, vec3 p0, vec3 p1, vec3 p2, float minT, float tMax,
+                   out float outT, out float outU, out float outV) {
+    vec3 e1 = p1 - p0;
+    vec3 e2 = p2 - p0;
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 1e-9) return false;
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - p0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, qvec) * invDet;
+    if (t < minT || t > tMax) return false;
+    outT = t; outU = u; outV = v;
+    return true;
+}
+
+bool traverseBVH(vec3 ro, vec3 rd, out uint bestPrim, out float bestU, out float bestV, out float bestT) {
+    vec3 invDir = safeInv(rd);
+    ivec3 dirSign = ivec3(rd.x < 0.0 ? 1 : 0, rd.y < 0.0 ? 1 : 0, rd.z < 0.0 ? 1 : 0);
+    int stack[MAX_STACK];
+    int sp = 0;
+    stack[sp++] = 0;
+    bestT = RAY_MAX_T;
+    bestPrim = 0xFFFFFFFFu;
+    bestU = 0.0; bestV = 0.0;
+    gTraverseCalls++;
+    while (sp > 0) {
+        gMaxSp = max(gMaxSp, sp);
+        int nodeIdx = stack[--sp];
+        BVHNode node = nodes[nodeIdx];
+        vec3 bmin = vec3(node.bminX, node.bminY, node.bminZ);
+        vec3 bmax = vec3(node.bmaxX, node.bmaxY, node.bmaxZ);
+        vec3 t0 = (bmin - ro) * invDir;
+        vec3 t1 = (bmax - ro) * invDir;
+        vec3 tsmall = min(t0, t1);
+        vec3 tbig   = max(t0, t1);
+        float tmin = max(max(tsmall.x, tsmall.y), max(tsmall.z, RAY_MIN_T));
+        float tmax = min(min(tbig.x, tbig.y), min(tbig.z, bestT));
+        if (tmin > tmax) continue;
+        if (node.flag == 0) {
+            int orderNear = (node.axis == 0) ? dirSign.x : (node.axis == 1 ? dirSign.y : dirSign.z);
+            uint nearIdx = (orderNear == 0) ? node.data0 : node.data1;
+            uint farIdx  = (orderNear == 0) ? node.data1 : node.data0;
+            if (sp < MAX_STACK - 1) {
+                stack[sp++] = int(farIdx);
+                stack[sp++] = int(nearIdx);
+            }
+        } else {
+            uint count  = node.data0;
+            uint offset = node.data1;
+            for (uint i = 0u; i < count; ++i) {
+                uint primIdx = indices[offset + i];
+                float t, u, v;
+                if (intersectTriV(ro, rd, triVert(primIdx,0u), triVert(primIdx,1u), triVert(primIdx,2u),
+                                  RAY_MIN_T, bestT, t, u, v)) {
+                    bestT = t; bestPrim = primIdx; bestU = u; bestV = v;
+                }
+            }
+        }
+    }
+    return bestPrim != 0xFFFFFFFFu;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x != uTargetPx || px.y != uTargetPy) return;  // only the target pixel does anything
+
+    float ndcX = (2.0 * (float(px.x) + 0.5) / float(uWidth)  - 1.0) * uAspect * uTanHalfFov;
+    float ndcY = (1.0 - 2.0 * (float(px.y) + 0.5) / float(uHeight)) * uTanHalfFov;
+    vec3 rd = normalize(uCamFront + ndcX * uCamRight + ndcY * uCamUp);
+    vec3 ro = uCamPos;
+
+    for (int pass = 0; pass < 32; ++pass) {
+        uint prim; float u, v, t;
+        if (!traverseBVH(ro, rd, prim, u, v, t)) {
+            dbg[0] = 0.0; dbg[1] = 1.0;  // hitFound=0, isBackground=1
+            dbg[19] = float(gMaxSp); dbg[20] = float(gTraverseCalls);
+            return;
+        }
+
+        float w0 = 1.0 - u - v;
+        vec3 n0 = triNorm(prim, 0u), n1 = triNorm(prim, 1u), n2 = triNorm(prim, 2u);
+        vec3 N = normalize(w0 * n0 + u * n1 + v * n2);
+        vec3 hitPos = ro + rd * t;
+        vec3 V = -rd;
+        if (dot(N, V) < 0.0) N = -N;
+        float eps = max(0.005, t * 1e-4);
+
+        if ((triFlags[prim] & 1u) != 0u) {
+            ro = hitPos + rd * eps;  // pass-through, matches checkpoint (b)
+            continue;
+        }
+
+        dbg[0] = 1.0;             // hitFound
+        dbg[1] = 0.0;             // isBackground
+        dbg[2] = float(prim);
+        dbg[3] = hitPos.x; dbg[4] = hitPos.y; dbg[5] = hitPos.z;
+        dbg[6] = u; dbg[7] = v;
+        dbg[8] = N.x; dbg[9] = N.y; dbg[10] = N.z;
+        dbg[11] = V.x; dbg[12] = V.y; dbg[13] = V.z;
+        dbg[14] = float(uNumLights);
+        for (int i = 0; i < uNumLights && i < 4; ++i) {
+            vec3 toLight = uLightPos[i] - hitPos;
+            float dist = length(toLight);
+            vec3 Li = dist > 1e-6 ? toLight / dist : vec3(0.0);
+            dbg[15 + i] = dot(N, Li);
+        }
+        dbg[19] = float(gMaxSp); dbg[20] = float(gTraverseCalls);
+        return;
+    }
+}

@@ -80,6 +80,7 @@ set(ENGINE_SOURCES
     src/CinematicEngine.cpp
     src/AudioManager.cpp
     src/RayTracer.cpp
+    src/GPURayTracer.cpp
 )
 
 add_executable(HorrorEngine ${ENGINE_SOURCES})

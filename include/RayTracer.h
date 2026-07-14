@@ -133,7 +133,108 @@ public:
     bool renderFrame(const Camera& cam, int w, int h, float exposure,
                      int samples, const std::string& outPath);
 
+    // ── Diagnostic (read-only, does not touch sTraceRay) ────────────────────────
+    // Walks the primary ray for pixel (px,py), following glass TRANSMISSION only
+    // (matches checkpoint-b pass-through — ignores the Fresnel reflection branch)
+    // until it hits opaque geometry or background. Captures the hit's identity
+    // and shading inputs for direct comparison against the GPU's equivalent walk.
+    // This mirrors sTraceRay's glass pass-through + normal-interpolation logic by
+    // duplication, not by calling it — sTraceRay itself is never modified.
+    struct RayDiagnostic {
+        bool         hit = false;
+        bool         isBackground = false;
+        unsigned int prim = 0xFFFFFFFFu;
+        glm::vec3  hitPos{0.0f};
+        float      baryU = 0.0f, baryV = 0.0f;
+        glm::vec3  N{0.0f};
+        glm::vec3  V{0.0f};
+        int        numLights = 0;
+        float      NdotL[4] = {0,0,0,0};
+    };
+    RayDiagnostic debugTraceOpaqueViaGlassPassThrough(const Camera& cam, int w, int h,
+                                                       int px, int py) const;
+
+    // Full recursive glass trace (mirrors sTraceRay's Fresnel branch exactly, by
+    // duplication — sTraceRay itself untouched) for one pixel, logged in the same
+    // flat format as GPURayTracer::traceGlassGPU for direct comparison:
+    // [0]=entryCount, then 6 floats/entry: [eventType,weight,depth,sp(-1 unused),tint.r,extra]
+    // eventType: 0=push-reflect 1=push-transmit 2=leaf-depth-exhausted-bg
+    //            3=leaf-miss-bg 4=leaf-opaque 5=drop-overflow(unused on CPU)
+    std::vector<float> debugTraceGlassFull(const Camera& cam, int w, int h, int px, int py) const;
+
+    // ── GPU export (read-only) ─────────────────────────────────────────────────
+    // Zero-copy view into the CPU-built BVH/geometry for uploading to GPU SSBOs.
+    // nodeBytes points at nanort::BVHNode<float> — kept as raw bytes here so
+    // nanort.h stays out of this header. Layout (verified via offsetof, 40 bytes,
+    // no padding): float bmin[3]; float bmax[3]; int flag; int axis; uint data[2];
+
+    // Per-material data for the GPU shader — 48 bytes, flat scalars (not vec3) so
+    // the layout matches a GLSL std430 struct byte-for-byte with no manual padding
+    // games. Built once per buildScene() by dedup'ing on Mesh pointer.
+    struct GPUMaterial {
+        float albedoR = 0, albedoG = 0, albedoB = 0, roughness = 0.5f;
+        float emissiveR = 0, emissiveG = 0, emissiveB = 0, emissiveStrength = 0;
+        float metallic = 0; unsigned int hasAlbedoTex = 0; float _pad0 = 0, _pad1 = 0;
+    };
+
+    struct GPUBVHExport {
+        const void*          nodeBytes        = nullptr;
+        size_t                nodeCount        = 0;
+        size_t                nodeStrideBytes  = 0;
+        const unsigned int*  indices          = nullptr;  // BVH leaf primitive remap
+        size_t                indexCount       = 0;
+        const float*         vertices         = nullptr;  // 9 floats/tri: v0,v1,v2
+        size_t                vertexFloatCount = 0;
+        const RTTriangle*    tris             = nullptr;  // parallel to vertices/prim_id
+        size_t                triCount         = 0;
+
+        // ── CP2 additions ──────────────────────────────────────────────────────
+        // Shadow BVH — opaque non-emissive geometry only (mirrors m_shadowBvh).
+        const void*          shadowNodeBytes        = nullptr;
+        size_t                shadowNodeCount        = 0;
+        size_t                shadowNodeStrideBytes  = 0;
+        const unsigned int*  shadowIndices          = nullptr;
+        size_t                shadowIndexCount       = 0;
+        const float*         shadowVertices         = nullptr;
+        size_t                shadowVertexFloatCount = 0;
+
+        // Materials, deduped by Mesh pointer, plus per-triangle lookups (parallel
+        // to `tris`/vertices/prim_id order — NOT BVH leaf order).
+        const GPUMaterial*    materials      = nullptr;
+        size_t                materialCount  = 0;
+        const unsigned int*  triMaterialID  = nullptr;  // index into materials[]
+        const unsigned int*  triFlags       = nullptr;  // bit0 = isGlass
+        const float*         triUVs         = nullptr;  // 6 floats/tri: uv0,uv1,uv2
+
+        // Single shared CPU albedo texture (the current CPU RT only ever samples
+        // one — see buildScene() comment). Linear float RGBA (alpha=1), sRGB
+        // already decoded on load, same source CPUTexture the CPU path samples.
+        const float*         albedoPixelsRGBA = nullptr; // albedoW*albedoH*4 floats
+        int                    albedoW = 0, albedoH = 0;
+    };
+    GPUBVHExport exportForGPU() const;
+
+    // ── GPU-preview post-process (CP5) ──────────────────────────────────────────
+    // Shared tail of renderFrame's pipeline (exposure -> OIDN -> bloom -> tonemap ->
+    // write), exposed so the GPU preview path can reuse the exact same CPU post-
+    // process code/settings (setBloomSettings/setOIDNSettings) instead of
+    // duplicating it. Does not touch renderFrame or any other existing method.
+    bool postProcessAndSave(std::vector<glm::vec3>& hdr,
+                            std::vector<glm::vec3>& albedo,
+                            std::vector<glm::vec3>& normal,
+                            int w, int h, float exposure,
+                            const std::string& outPath);
+
 private:
+    // Built once at the end of buildScene(); see exportForGPU().
+    void buildGPUMaterialData();
+    std::vector<GPUMaterial>   m_gpuMaterials;
+    std::vector<unsigned int>  m_gpuTriMaterialID;
+    std::vector<unsigned int>  m_gpuTriFlags;
+    std::vector<float>         m_gpuTriUVs;
+    std::vector<float>         m_gpuAlbedoRGBA;
+    int                          m_gpuAlbedoW = 0, m_gpuAlbedoH = 0;
+
     // m_tris[i] parallel to BVH face i — used for normal/material lookup after hit
     std::vector<RTTriangle>   m_tris;
     // Flat position arrays fed to nanort (triangle soup: no shared vertices)

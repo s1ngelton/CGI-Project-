@@ -1,0 +1,357 @@
+#version 430 core
+// CP5 — GPU iteration/preview shader. Opaque BRDF+shadows are identical to CP2
+// (proven match vs CPU). Glass is a DELIBERATE, documented approximation, not a
+// bug: a single Fresnel-weighted "sheen" blended with straight-through
+// transmission, no recursion, no multi-bounce. Fast, good enough to judge
+// camera/lighting/mood while iterating. The CPU path (renderBeauty with
+// glassPassThrough=false, exact recursive Fresnel) remains the reference for
+// the final render — see shaders/CP4_GLASS_NOTES.md for why the GPU recursive
+// version isn't used here.
+//
+// Outputs HDR color + albedo/normal AOVs (all RGBA32F) for CPU-side OIDN, same
+// pipeline RayTracer::renderFrame already uses (RayTracer::postProcessAndSave).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct BVHNode {
+    float bminX, bminY, bminZ;
+    float bmaxX, bmaxY, bmaxZ;
+    int   flag;
+    int   axis;
+    uint  data0;
+    uint  data1;
+};
+
+struct GPUMaterial {
+    float albedoR, albedoG, albedoB, roughness;
+    float emissiveR, emissiveG, emissiveB, emissiveStrength;
+    float metallic;
+    uint  hasAlbedoTex;
+    float _pad0, _pad1;
+};
+
+layout(std430, binding = 0) readonly buffer NodesBuf   { BVHNode nodes[]; };
+layout(std430, binding = 1) readonly buffer IndicesBuf { uint    indices[]; };
+layout(std430, binding = 2) readonly buffer VertsBuf   { float   verts[]; };
+layout(std430, binding = 3) readonly buffer NormalsBuf { float   norms[]; };
+
+layout(binding = 4, rgba32f) uniform writeonly image2D outColor;
+layout(binding = 5, rgba32f) uniform writeonly image2D outAlbedo;
+layout(binding = 6, rgba32f) uniform writeonly image2D outNormal;
+
+layout(std430, binding = 5) readonly buffer MaterialsBuf { GPUMaterial materials[]; };
+layout(std430, binding = 6) readonly buffer TriMatBuf    { uint  triMat[]; };
+layout(std430, binding = 7) readonly buffer TriFlagsBuf  { uint  triFlags[]; };
+layout(std430, binding = 8) readonly buffer TriUVBuf     { float triUVs[]; };
+
+layout(std430, binding = 9)  readonly buffer ShadowNodesBuf   { BVHNode shNodes[]; };
+layout(std430, binding = 10) readonly buffer ShadowIndicesBuf { uint    shIndices[]; };
+layout(std430, binding = 11) readonly buffer ShadowVertsBuf   { float   shVerts[]; };
+
+layout(binding = 0) uniform sampler2D uAlbedoTex;
+
+uniform vec3  uCamPos;
+uniform vec3  uCamFront;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform float uAspect;
+uniform float uTanHalfFov;
+uniform int   uWidth;
+uniform int   uHeight;
+uniform float uExposure; // unused here — postProcessAndSave applies exposure on CPU
+
+uniform int   uNumLights;
+uniform vec3  uLightPos[4];
+uniform vec3  uLightColor[4];
+uniform float uLightIntensity[4];
+uniform float uLightRadius;
+
+#define MAX_STACK 160  // BVH depth is 126 (reported at buildScene) — must exceed that
+#define MAX_GLASS_PASSES 32
+#define RAY_MIN_T 0.001
+#define RAY_MAX_T 1.0e30
+const float kPI = 3.14159265359;
+const vec3  kBackground = vec3(0.02, 0.025, 0.04);
+const vec3  kGlassTint  = vec3(0.82, 0.88, 1.0);
+
+vec3 triVert(uint triIdx, uint which) {
+    uint base = triIdx * 9u + which * 3u;
+    return vec3(verts[base + 0u], verts[base + 1u], verts[base + 2u]);
+}
+vec3 triNorm(uint triIdx, uint which) {
+    uint base = triIdx * 9u + which * 3u;
+    return vec3(norms[base + 0u], norms[base + 1u], norms[base + 2u]);
+}
+vec2 triUV(uint triIdx, uint which) {
+    uint base = triIdx * 6u + which * 2u;
+    return vec2(triUVs[base + 0u], triUVs[base + 1u]);
+}
+vec3 shVert(uint triIdx, uint which) {
+    uint base = triIdx * 9u + which * 3u;
+    return vec3(shVerts[base + 0u], shVerts[base + 1u], shVerts[base + 2u]);
+}
+
+vec3 safeInv(vec3 v) {
+    vec3 s = vec3(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0, v.z >= 0.0 ? 1.0 : -1.0);
+    vec3 av = abs(v);
+    const float kEps = 1e-12;
+    return vec3(
+        1.0 / (av.x < kEps ? kEps * s.x : v.x),
+        1.0 / (av.y < kEps ? kEps * s.y : v.y),
+        1.0 / (av.z < kEps ? kEps * s.z : v.z)
+    );
+}
+
+bool intersectTriV(vec3 ro, vec3 rd, vec3 p0, vec3 p1, vec3 p2, float minT, float tMax,
+                   out float outT, out float outU, out float outV) {
+    vec3 e1 = p1 - p0;
+    vec3 e2 = p2 - p0;
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 1e-9) return false;
+    float invDet = 1.0 / det;
+
+    vec3 tvec = ro - p0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(e2, qvec) * invDet;
+    if (t < minT || t > tMax) return false;
+
+    outT = t; outU = u; outV = v;
+    return true;
+}
+
+bool traverseBVH(vec3 ro, vec3 rd, out uint bestPrim, out float bestU, out float bestV, out float bestT) {
+    vec3 invDir = safeInv(rd);
+    ivec3 dirSign = ivec3(rd.x < 0.0 ? 1 : 0, rd.y < 0.0 ? 1 : 0, rd.z < 0.0 ? 1 : 0);
+
+    int stack[MAX_STACK];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    bestT = RAY_MAX_T;
+    bestPrim = 0xFFFFFFFFu;
+    bestU = 0.0; bestV = 0.0;
+
+    while (sp > 0) {
+        int nodeIdx = stack[--sp];
+        BVHNode node = nodes[nodeIdx];
+
+        vec3 bmin = vec3(node.bminX, node.bminY, node.bminZ);
+        vec3 bmax = vec3(node.bmaxX, node.bmaxY, node.bmaxZ);
+        vec3 t0 = (bmin - ro) * invDir;
+        vec3 t1 = (bmax - ro) * invDir;
+        vec3 tsmall = min(t0, t1);
+        vec3 tbig   = max(t0, t1);
+        float tmin = max(max(tsmall.x, tsmall.y), max(tsmall.z, RAY_MIN_T));
+        float tmax = min(min(tbig.x, tbig.y), min(tbig.z, bestT));
+        if (tmin > tmax) continue;
+
+        if (node.flag == 0) {
+            int orderNear = (node.axis == 0) ? dirSign.x : (node.axis == 1 ? dirSign.y : dirSign.z);
+            uint nearIdx = (orderNear == 0) ? node.data0 : node.data1;
+            uint farIdx  = (orderNear == 0) ? node.data1 : node.data0;
+            if (sp < MAX_STACK - 1) {
+                stack[sp++] = int(farIdx);
+                stack[sp++] = int(nearIdx);
+            }
+        } else {
+            uint count  = node.data0;
+            uint offset = node.data1;
+            for (uint i = 0u; i < count; ++i) {
+                uint primIdx = indices[offset + i];
+                float t, u, v;
+                if (intersectTriV(ro, rd, triVert(primIdx,0u), triVert(primIdx,1u), triVert(primIdx,2u),
+                                  RAY_MIN_T, bestT, t, u, v)) {
+                    bestT = t; bestPrim = primIdx; bestU = u; bestV = v;
+                }
+            }
+        }
+    }
+    return bestPrim != 0xFFFFFFFFu;
+}
+
+bool shadowHit(vec3 ro, vec3 rd, float maxT) {
+    vec3 invDir = safeInv(rd);
+    ivec3 dirSign = ivec3(rd.x < 0.0 ? 1 : 0, rd.y < 0.0 ? 1 : 0, rd.z < 0.0 ? 1 : 0);
+
+    int stack[MAX_STACK];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+        int nodeIdx = stack[--sp];
+        BVHNode node = shNodes[nodeIdx];
+
+        vec3 bmin = vec3(node.bminX, node.bminY, node.bminZ);
+        vec3 bmax = vec3(node.bmaxX, node.bmaxY, node.bmaxZ);
+        vec3 t0 = (bmin - ro) * invDir;
+        vec3 t1 = (bmax - ro) * invDir;
+        vec3 tsmall = min(t0, t1);
+        vec3 tbig   = max(t0, t1);
+        float tmin = max(max(tsmall.x, tsmall.y), max(tsmall.z, 0.0));
+        float tmax = min(min(tbig.x, tbig.y), min(tbig.z, maxT));
+        if (tmin > tmax) continue;
+
+        if (node.flag == 0) {
+            int orderNear = (node.axis == 0) ? dirSign.x : (node.axis == 1 ? dirSign.y : dirSign.z);
+            uint nearIdx = (orderNear == 0) ? node.data0 : node.data1;
+            uint farIdx  = (orderNear == 0) ? node.data1 : node.data0;
+            if (sp < MAX_STACK - 1) {
+                stack[sp++] = int(farIdx);
+                stack[sp++] = int(nearIdx);
+            }
+        } else {
+            uint count  = node.data0;
+            uint offset = node.data1;
+            for (uint i = 0u; i < count; ++i) {
+                uint primIdx = shIndices[offset + i];
+                float t, u, v;
+                if (intersectTriV(ro, rd, shVert(primIdx,0u), shVert(primIdx,1u), shVert(primIdx,2u),
+                                  0.0, maxT, t, u, v))
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+float D_GGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (kPI * d * d);
+}
+float G_SmithGGX(float NdotV, float NdotL, float roughness) {
+    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    float gv = NdotV / (NdotV * (1.0 - k) + k);
+    float gl = NdotL / (NdotL * (1.0 - k) + k);
+    return gv * gl;
+}
+vec3 F_Schlick(float HdotV, vec3 F0) {
+    float t = max(1.0 - HdotV, 0.0);
+    return F0 + (vec3(1.0) - F0) * (t*t*t*t*t);
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= uWidth || px.y >= uHeight) return;
+
+    float ndcX = (2.0 * (float(px.x) + 0.5) / float(uWidth)  - 1.0) * uAspect * uTanHalfFov;
+    float ndcY = (1.0 - 2.0 * (float(px.y) + 0.5) / float(uHeight)) * uTanHalfFov;
+    vec3 rd = normalize(uCamFront + ndcX * uCamRight + ndcY * uCamUp);
+    vec3 ro = uCamPos;
+
+    vec3 throughputTint = vec3(1.0);
+    vec3 sheenAccum = vec3(0.0);
+    vec3 result = kBackground;
+
+    vec3 auxAlbedo = kBackground;
+    vec3 auxNormal = vec3(0.0, 0.0, 1.0);
+    bool auxCaptured = false;
+
+    for (int pass = 0; pass < MAX_GLASS_PASSES; ++pass) {
+        uint prim; float u, v, t;
+        if (!traverseBVH(ro, rd, prim, u, v, t)) {
+            result = sheenAccum + throughputTint * kBackground;
+            break;
+        }
+
+        float w0 = 1.0 - u - v;
+        vec3 n0 = triNorm(prim, 0u), n1 = triNorm(prim, 1u), n2 = triNorm(prim, 2u);
+        vec3 N = normalize(w0 * n0 + u * n1 + v * n2);
+        vec3 hitPos = ro + rd * t;
+        vec3 V = -rd;
+        if (dot(N, V) < 0.0) N = -N;
+        float NdotV = max(dot(N, V), 0.0);
+        float eps = max(0.005, t * 1e-4);
+        bool isGlass = (triFlags[prim] & 1u) != 0u;
+
+        if (!auxCaptured) {
+            // Mirrors RayTracer::renderFrame's aux capture: normal from the very
+            // first hit (even if glass), albedo only if that first hit is opaque.
+            auxNormal = N;
+            if (!isGlass) {
+                uint auxMatIdx = triMat[prim];
+                GPUMaterial am = materials[auxMatIdx];
+                if (am.hasAlbedoTex == 1u) {
+                    vec2 auv0 = triUV(prim,0u), auv1 = triUV(prim,1u), auv2 = triUV(prim,2u);
+                    auxAlbedo = texture(uAlbedoTex, w0*auv0 + u*auv1 + v*auv2).rgb;
+                } else {
+                    auxAlbedo = vec3(am.albedoR, am.albedoG, am.albedoB);
+                }
+            }
+            auxCaptured = true;
+        }
+
+        if (isGlass) {
+            // Deliberate non-recursive approximation (see file header comment):
+            // Fresnel-weighted sheen accumulated front-to-back, no bounce trace.
+            float cosTheta = NdotV;
+            float t1 = 1.0 - cosTheta;
+            float fresnel = 0.04 + 0.96 * (t1*t1*t1*t1*t1);
+
+            sheenAccum += throughputTint * fresnel * kBackground;
+            throughputTint *= (1.0 - fresnel) * kGlassTint;
+            ro = hitPos + rd * eps;
+            continue;
+        }
+
+        // Opaque: Cook-Torrance GGX + shadow rays — identical to CP2.
+        uint matIdx = triMat[prim];
+        GPUMaterial m = materials[matIdx];
+        vec3 albedo = vec3(m.albedoR, m.albedoG, m.albedoB);
+        if (m.hasAlbedoTex == 1u) {
+            vec2 uv0 = triUV(prim, 0u), uv1 = triUV(prim, 1u), uv2 = triUV(prim, 2u);
+            vec2 uv = w0 * uv0 + u * uv1 + v * uv2;
+            albedo = texture(uAlbedoTex, uv).rgb;
+        }
+        float roughness = max(m.roughness, 0.04);
+        float metallic = m.metallic;
+        vec3 F0 = mix(vec3(0.04), albedo, metallic);
+        vec3 shadowOrg = hitPos + N * eps;
+
+        vec3 Lo = vec3(0.0);
+        for (int i = 0; i < uNumLights; ++i) {
+            vec3 toLight = uLightPos[i] - hitPos;
+            float distToLight = length(toLight);
+            if (distToLight < 1e-6) continue;
+            vec3 Li = toLight / distToLight;
+            float NdotLi = max(dot(N, Li), 0.0);
+            if (NdotLi <= 0.0) continue;
+
+            if (shadowHit(shadowOrg, Li, distToLight - 0.02)) continue;
+
+            vec3 Hi = normalize(V + Li);
+            float NdotHi = max(dot(N, Hi), 0.0);
+            float HdotVi = max(dot(Hi, V), 0.0);
+            vec3 Fi = F_Schlick(HdotVi, F0);
+            float Di = D_GGX(NdotHi, roughness);
+            float Gi = G_SmithGGX(NdotV, NdotLi, roughness);
+            vec3 specBRDF = Di * Gi * Fi / max(4.0 * NdotV * NdotLi, 0.001);
+            vec3 kDi = (vec3(1.0) - Fi) * (1.0 - metallic);
+            vec3 diffBRDF = kDi * albedo / kPI;
+
+            float dist2 = distToLight * distToLight;
+            float att2 = dist2 / (uLightRadius * uLightRadius);
+            float att = max(0.0, 1.0 - att2);
+            att *= att;
+
+            vec3 radiance = uLightColor[i] * att * uLightIntensity[i];
+            Lo += (diffBRDF + specBRDF) * radiance * NdotLi;
+        }
+
+        vec3 leafColor = Lo + vec3(m.emissiveR, m.emissiveG, m.emissiveB) * m.emissiveStrength;
+        result = sheenAccum + throughputTint * leafColor;
+        break;
+    }
+
+    imageStore(outColor,  px, vec4(result, 1.0));
+    imageStore(outAlbedo, px, vec4(auxAlbedo, 1.0));
+    imageStore(outNormal, px, vec4(auxNormal, 1.0));
+}

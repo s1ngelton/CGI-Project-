@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <iostream>
 #include <cmath>
+#include <unordered_map>
 
 #ifdef HAS_OIDN
 #include <OpenImageDenoise/oidn.hpp>
@@ -46,6 +47,52 @@ struct RayTracer::BVH {
 
 RayTracer::RayTracer()  = default;
 RayTracer::~RayTracer() = default;
+
+// nanort::BVHNode<float> layout assumed by GPURayTracer's SSBO upload (RayTracer.h
+// GPUBVHExport doc comment). If this ever fails, the GPU node struct needs updating.
+static_assert(sizeof(nanort::BVHNode<float>) == 40,
+              "nanort::BVHNode<float> layout changed — update GPU SSBO struct too");
+static_assert(sizeof(RayTracer::GPUMaterial) == 48,
+              "GPUMaterial layout changed — update the mirrored GLSL struct too");
+
+RayTracer::GPUBVHExport RayTracer::exportForGPU() const {
+    GPUBVHExport ex;
+    if (!m_bvh) return ex;
+    const auto& nodes = m_bvh->accel.GetNodes();
+    const auto& idx    = m_bvh->accel.GetIndices();
+    ex.nodeBytes        = nodes.data();
+    ex.nodeCount         = nodes.size();
+    ex.nodeStrideBytes   = sizeof(nodes[0]);
+    ex.indices           = idx.data();
+    ex.indexCount        = idx.size();
+    ex.vertices          = m_vertices.data();
+    ex.vertexFloatCount  = m_vertices.size();
+    ex.tris              = m_tris.data();
+    ex.triCount          = m_tris.size();
+
+    if (m_shadowBvh) {
+        const auto& snodes = m_shadowBvh->accel.GetNodes();
+        const auto& sidx    = m_shadowBvh->accel.GetIndices();
+        ex.shadowNodeBytes        = snodes.data();
+        ex.shadowNodeCount        = snodes.size();
+        ex.shadowNodeStrideBytes  = sizeof(snodes[0]);
+        ex.shadowIndices          = sidx.data();
+        ex.shadowIndexCount       = sidx.size();
+        ex.shadowVertices         = m_shadowVerts.data();
+        ex.shadowVertexFloatCount = m_shadowVerts.size();
+    }
+
+    ex.materials     = m_gpuMaterials.data();
+    ex.materialCount = m_gpuMaterials.size();
+    ex.triMaterialID = m_gpuTriMaterialID.data();
+    ex.triFlags      = m_gpuTriFlags.data();
+    ex.triUVs        = m_gpuTriUVs.data();
+    ex.albedoPixelsRGBA = m_gpuAlbedoRGBA.empty() ? nullptr : m_gpuAlbedoRGBA.data();
+    ex.albedoW = m_gpuAlbedoW;
+    ex.albedoH = m_gpuAlbedoH;
+
+    return ex;
+}
 
 // ── Scene extraction ──────────────────────────────────────────────────────────
 void RayTracer::buildScene(const Scene& scene) {
@@ -166,6 +213,73 @@ void RayTracer::buildScene(const Scene& scene) {
                 std::cout << "[RayTracer] Shadow BVH: " << numShadow << " tris, "
                           << "depth " << s.max_tree_depth << "\n";
             }
+        }
+    }
+
+    buildGPUMaterialData();
+}
+
+// ── GPU material export (CP2) ─────────────────────────────────────────────────
+// Dedups materials by Mesh pointer (stable for the lifetime of the Scene/Model
+// objects buildScene() was called with) and builds per-triangle lookups parallel
+// to m_tris/m_vertices (prim_id order). The current CPU RT only ever samples one
+// CPU-side texture (RTTriangle::mesh->cpuAlbedo — see checkpoint-(b) comment:
+// roughness/metallic are scalar-only in sTraceRay, never texture-sampled), so a
+// single shared texture is uploaded rather than a full atlas/bindless system.
+// If a future scene adds a second RT-sampled texture, this is the place to widen
+// it to an array/atlas.
+void RayTracer::buildGPUMaterialData() {
+    m_gpuMaterials.clear();
+    m_gpuTriMaterialID.assign(m_tris.size(), 0);
+    m_gpuTriFlags.assign(m_tris.size(), 0);
+    m_gpuTriUVs.assign(m_tris.size() * 6, 0.0f);
+    m_gpuAlbedoRGBA.clear();
+    m_gpuAlbedoW = m_gpuAlbedoH = 0;
+
+    std::unordered_map<const Mesh*, unsigned int> matIndex;
+    const CPUTexture* sharedAlbedo = nullptr;
+
+    for (size_t i = 0; i < m_tris.size(); ++i) {
+        const RTTriangle& t = m_tris[i];
+        m_gpuTriUVs[i*6+0] = t.uv0.x; m_gpuTriUVs[i*6+1] = t.uv0.y;
+        m_gpuTriUVs[i*6+2] = t.uv1.x; m_gpuTriUVs[i*6+3] = t.uv1.y;
+        m_gpuTriUVs[i*6+4] = t.uv2.x; m_gpuTriUVs[i*6+5] = t.uv2.y;
+
+        if (t.isGlass) { m_gpuTriFlags[i] = 1u; continue; }  // material unused by glass shading
+
+        auto it = matIndex.find(t.mesh);
+        unsigned int idx;
+        if (it == matIndex.end()) {
+            GPUMaterial gm;
+            gm.albedoR = t.mesh->albedoColor.r;
+            gm.albedoG = t.mesh->albedoColor.g;
+            gm.albedoB = t.mesh->albedoColor.b;
+            gm.roughness = t.mesh->roughness;
+            gm.emissiveR = t.mesh->emissiveColor.r;
+            gm.emissiveG = t.mesh->emissiveColor.g;
+            gm.emissiveB = t.mesh->emissiveColor.b;
+            gm.emissiveStrength = t.mesh->emissiveStrength;
+            gm.metallic = t.mesh->metallic;
+            gm.hasAlbedoTex = (t.mesh->cpuAlbedo && t.mesh->cpuAlbedo->valid()) ? 1u : 0u;
+            if (gm.hasAlbedoTex && !sharedAlbedo) sharedAlbedo = t.mesh->cpuAlbedo.get();
+            idx = (unsigned int)m_gpuMaterials.size();
+            m_gpuMaterials.push_back(gm);
+            matIndex.emplace(t.mesh, idx);
+        } else {
+            idx = it->second;
+        }
+        m_gpuTriMaterialID[i] = idx;
+    }
+
+    if (sharedAlbedo) {
+        m_gpuAlbedoW = sharedAlbedo->width;
+        m_gpuAlbedoH = sharedAlbedo->height;
+        m_gpuAlbedoRGBA.resize((size_t)m_gpuAlbedoW * m_gpuAlbedoH * 4);
+        for (size_t p = 0; p < sharedAlbedo->pixels.size(); ++p) {
+            m_gpuAlbedoRGBA[p*4+0] = sharedAlbedo->pixels[p].r;
+            m_gpuAlbedoRGBA[p*4+1] = sharedAlbedo->pixels[p].g;
+            m_gpuAlbedoRGBA[p*4+2] = sharedAlbedo->pixels[p].b;
+            m_gpuAlbedoRGBA[p*4+3] = 1.0f;
         }
     }
 }
@@ -402,6 +516,235 @@ static glm::vec3 sTraceRay(const nanort::Ray<float>& ray, int depth, const Trace
 
     // Emissive — additive, bypasses shadow/BRDF
     return Lo + mesh->emissiveColor * mesh->emissiveStrength;
+}
+
+// ── Diagnostic (read-only, duplicated logic — sTraceRay above is untouched) ──
+RayTracer::RayDiagnostic RayTracer::debugTraceOpaqueViaGlassPassThrough(
+    const Camera& cam, int w, int h, int px, int py) const {
+    RayDiagnostic diag;
+    if (!m_bvh || m_tris.empty()) return diag;
+
+    float aspect     = (float)w / (float)h;
+    float tanHalfFov = std::tan(cam.Zoom * 0.5f * (float)M_PI / 180.0f);
+    float ndcX = (2.0f * (px + 0.5f) / w - 1.0f) * aspect * tanHalfFov;
+    float ndcY = (1.0f - 2.0f * (py + 0.5f) / h) * tanHalfFov;
+    glm::vec3 rd = glm::normalize(cam.Front + ndcX * cam.Right + ndcY * cam.Up);
+    glm::vec3 ro = cam.Position;
+
+    nanort::TriangleMesh<float>        nanortMesh(m_vertices.data(), m_faces.data(), sizeof(float) * 3);
+    nanort::TriangleIntersector<float> intersector(nanortMesh);
+    nanort::BVHTraceOptions            opts;
+
+    for (int pass = 0; pass < 32; ++pass) {
+        nanort::Ray<float> ray;
+        ray.org[0] = ro.x; ray.org[1] = ro.y; ray.org[2] = ro.z;
+        ray.dir[0] = rd.x; ray.dir[1] = rd.y; ray.dir[2] = rd.z;
+        ray.min_t = 0.001f; ray.max_t = 1.0e30f;
+
+        nanort::TriangleIntersection<float> isect;
+        if (!m_bvh->accel.Traverse(ray, intersector, &isect, opts)) {
+            diag.hit = false;
+            diag.isBackground = true;
+            return diag;
+        }
+
+        const RTTriangle& tri = m_tris[isect.prim_id];
+        float u = isect.u, v = isect.v, w0 = 1.0f - u - v;
+        glm::vec3 N = glm::normalize(w0 * tri.n0 + u * tri.n1 + v * tri.n2);
+        glm::vec3 hitPos = ro + rd * isect.t;
+        glm::vec3 V = -rd;
+        if (glm::dot(N, V) < 0.0f) N = -N;
+        float eps = std::max(0.005f, isect.t * 1e-4f);
+
+        if (tri.isGlass) {
+            ro = hitPos + rd * eps;  // pass-through, matches checkpoint (b) exactly
+            continue;
+        }
+
+        diag.hit = true;
+        diag.isBackground = false;
+        diag.prim   = isect.prim_id;
+        diag.hitPos = hitPos;
+        diag.baryU  = u;
+        diag.baryV  = v;
+        diag.N = N;
+        diag.V = V;
+        diag.numLights = (int)m_lights.size();
+        if (diag.numLights > 4) diag.numLights = 4;
+        for (int i = 0; i < diag.numLights; ++i) {
+            glm::vec3 toLight = m_lights[i].position - hitPos;
+            float dist = glm::length(toLight);
+            glm::vec3 Li = dist > 1e-6f ? toLight / dist : glm::vec3(0.0f);
+            diag.NdotL[i] = glm::dot(N, Li);
+        }
+        return diag;
+    }
+    return diag;
+}
+
+// Recursive helper for debugTraceGlassFull — duplicates sTraceRay's Fresnel
+// branch exactly (sTraceRay itself is never called or modified here).
+static void debugRecurseGlass(const nanort::Ray<float>& ray, int depth,
+                              float weight, glm::vec3 tint, const TraceCtx& ctx,
+                              std::vector<float>& trace, glm::vec3& resultAccum) {
+    static const glm::vec3 kGlassTintDbg(0.82f, 0.88f, 1.0f);
+    auto log = [&](int evt, float w, int d, float tintR, float extra) {
+        if (trace.size() / 6 < 100) {  // generous cap, CPU side has no hard limit otherwise
+            trace.push_back((float)evt);
+            trace.push_back(w);
+            trace.push_back((float)d);
+            trace.push_back(-1.0f);  // sp: unused on CPU (true recursion, no explicit stack)
+            trace.push_back(tintR);
+            trace.push_back(extra);
+        }
+    };
+
+    if (depth <= 0) {
+        resultAccum += weight * tint * ctx.background;
+        log(2, weight, depth, tint.r, 0.0f);
+        return;
+    }
+
+    nanort::TriangleIntersection<float> isect;
+    if (!ctx.primaryBVH->Traverse(ray, *ctx.primaryInter, &isect, ctx.opts)) {
+        resultAccum += weight * tint * ctx.background;
+        log(3, weight, depth, tint.r, 0.0f);
+        return;
+    }
+
+    const RTTriangle& tri = (*ctx.tris)[isect.prim_id];
+    float u = isect.u, v = isect.v, w0 = 1.0f - u - v;
+    glm::vec3 N = glm::normalize(w0 * tri.n0 + u * tri.n1 + v * tri.n2);
+    glm::vec3 org(ray.org[0], ray.org[1], ray.org[2]);
+    glm::vec3 rd(ray.dir[0], ray.dir[1], ray.dir[2]);
+    glm::vec3 hitPos = org + rd * isect.t;
+    glm::vec3 V = -rd;
+    if (glm::dot(N, V) < 0.0f) N = -N;
+    float NdotV = std::max(glm::dot(N, V), 0.0f);
+    float eps = std::max(0.005f, isect.t * 1e-4f);
+
+    if (tri.isGlass) {
+        float cosTheta = NdotV;
+        float t1 = 1.0f - cosTheta;
+        float fresnel = 0.04f + 0.96f * (t1*t1*t1*t1*t1);
+
+        glm::vec3 R = glm::reflect(rd, N);
+        glm::vec3 reflOrg = hitPos + N * eps;
+        nanort::Ray<float> reflRay;
+        reflRay.org[0]=reflOrg.x; reflRay.org[1]=reflOrg.y; reflRay.org[2]=reflOrg.z;
+        reflRay.dir[0]=R.x;       reflRay.dir[1]=R.y;       reflRay.dir[2]=R.z;
+        reflRay.min_t=0.0f; reflRay.max_t=1.0e30f;
+        log(0, weight * fresnel, depth - 1, tint.r, fresnel);
+        debugRecurseGlass(reflRay, depth - 1, weight * fresnel, tint, ctx, trace, resultAccum);
+
+        glm::vec3 transOrg = hitPos + rd * eps;
+        nanort::Ray<float> transRay;
+        transRay.org[0]=transOrg.x; transRay.org[1]=transOrg.y; transRay.org[2]=transOrg.z;
+        transRay.dir[0]=rd.x;       transRay.dir[1]=rd.y;       transRay.dir[2]=rd.z;
+        transRay.min_t=0.0f; transRay.max_t=1.0e30f;
+        glm::vec3 newTint = tint * kGlassTintDbg;
+        log(1, weight * (1.0f - fresnel), depth - 1, newTint.r, fresnel);
+        debugRecurseGlass(transRay, depth - 1, weight * (1.0f - fresnel), newTint, ctx, trace, resultAccum);
+        return;
+    }
+
+    // Opaque leaf — identical shading math to sTraceRay.
+    const Mesh* mesh = tri.mesh;
+    glm::vec3 albedo;
+    if (mesh->cpuAlbedo && mesh->cpuAlbedo->valid()) {
+        glm::vec2 texUV = w0*tri.uv0 + u*tri.uv1 + v*tri.uv2;
+        albedo = mesh->cpuAlbedo->sample(texUV.x, texUV.y);
+    } else {
+        albedo = mesh->albedoColor;
+    }
+    float roughness = std::max(mesh->roughness, 0.04f);
+    float metallic  = mesh->metallic;
+    glm::vec3 F0 = glm::mix(glm::vec3(0.04f), albedo, metallic);
+    glm::vec3 shadowOrg = hitPos + N * eps;
+
+    glm::vec3 Lo(0.0f);
+    for (const RTLight& light : *ctx.lights) {
+        glm::vec3 toLight = light.position - hitPos;
+        float distToLight = glm::length(toLight);
+        if (distToLight < 1e-6f) continue;
+        glm::vec3 Li = toLight / distToLight;
+        float NdotLi = std::max(glm::dot(N, Li), 0.0f);
+        if (NdotLi <= 0.0f) continue;
+
+        nanort::Ray<float> shadowRay;
+        shadowRay.org[0]=shadowOrg.x; shadowRay.org[1]=shadowOrg.y; shadowRay.org[2]=shadowOrg.z;
+        shadowRay.dir[0]=Li.x;        shadowRay.dir[1]=Li.y;        shadowRay.dir[2]=Li.z;
+        shadowRay.min_t=0.0f;
+        shadowRay.max_t=distToLight - 0.02f;
+        nanort::TriangleIntersection<float> shadowIsect;
+        if (ctx.shadowBVH && ctx.shadowBVH->Traverse(shadowRay, *ctx.shadowInter, &shadowIsect, ctx.opts))
+            continue;
+
+        glm::vec3 Hi = glm::normalize(V + Li);
+        float NdotHi = std::max(glm::dot(N, Hi), 0.0f);
+        float HdotVi = std::max(glm::dot(Hi, V), 0.0f);
+        glm::vec3 Fi = F_Schlick(HdotVi, F0);
+        float Di = D_GGX(NdotHi, roughness);
+        float Gi = G_SmithGGX(NdotV, NdotLi, roughness);
+        glm::vec3 specBRDF = Di*Gi*Fi / std::max(4.0f*NdotV*NdotLi, 0.001f);
+        glm::vec3 kDi = (glm::vec3(1.0f)-Fi)*(1.0f-metallic);
+        glm::vec3 diffBRDF = kDi*albedo/kPI;
+
+        float dist2 = distToLight * distToLight;
+        float att2  = dist2 / (ctx.lightRadius * ctx.lightRadius);
+        float att   = std::max(0.0f, 1.0f - att2);
+        att *= att;
+        glm::vec3 radiance = light.color * att * light.intensity;
+        Lo += (diffBRDF + specBRDF) * radiance * NdotLi;
+    }
+
+    glm::vec3 leafColor = Lo + mesh->emissiveColor * mesh->emissiveStrength;
+    resultAccum += weight * tint * leafColor;
+    log(4, weight, depth, tint.r, leafColor.r);
+}
+
+std::vector<float> RayTracer::debugTraceGlassFull(const Camera& cam, int w, int h, int px, int py) const {
+    std::vector<float> trace;
+    trace.push_back(0.0f);  // placeholder for count at index 0
+    if (!m_bvh || m_tris.empty()) return trace;
+
+    float aspect     = (float)w / (float)h;
+    float tanHalfFov = std::tan(cam.Zoom * 0.5f * (float)M_PI / 180.0f);
+    float ndcX = (2.0f * (px + 0.5f) / w - 1.0f) * aspect * tanHalfFov;
+    float ndcY = (1.0f - 2.0f * (py + 0.5f) / h) * tanHalfFov;
+    glm::vec3 rd = glm::normalize(cam.Front + ndcX * cam.Right + ndcY * cam.Up);
+
+    nanort::TriangleMesh<float>        nanortMesh(m_vertices.data(), m_faces.data(), sizeof(float)*3);
+    nanort::TriangleIntersector<float> intersector(nanortMesh);
+    nanort::TriangleMesh<float>        shadowMesh(m_shadowVerts.data(), m_shadowFaces.data(), sizeof(float)*3);
+    nanort::TriangleIntersector<float> shadowInter(shadowMesh);
+    static const glm::vec3 kBackground(0.02f, 0.025f, 0.04f);
+
+    TraceCtx ctx;
+    ctx.primaryBVH   = &m_bvh->accel;
+    ctx.primaryMesh  = &nanortMesh;
+    ctx.primaryInter = &intersector;
+    ctx.shadowBVH    = m_shadowBvh ? &m_shadowBvh->accel : nullptr;
+    ctx.shadowMesh   = &shadowMesh;
+    ctx.shadowInter  = &shadowInter;
+    ctx.tris         = &m_tris;
+    ctx.lights       = &m_lights;
+    ctx.lightRadius  = m_lightRadius;
+    ctx.background   = kBackground;
+    ctx.glassPassThrough = false;
+
+    nanort::Ray<float> ray;
+    ray.org[0]=cam.Position.x; ray.org[1]=cam.Position.y; ray.org[2]=cam.Position.z;
+    ray.dir[0]=rd.x; ray.dir[1]=rd.y; ray.dir[2]=rd.z;
+    ray.min_t=0.001f; ray.max_t=1.0e30f;
+
+    glm::vec3 resultAccum(0.0f);
+    std::vector<float> entries;
+    debugRecurseGlass(ray, 4, 1.0f, glm::vec3(1.0f), ctx, entries, resultAccum);
+
+    trace[0] = (float)(entries.size() / 6);
+    trace.insert(trace.end(), entries.begin(), entries.end());
+    return trace;
 }
 
 // ── Checkpoint (b/c): beauty render ──────────────────────────────────────────
@@ -756,9 +1099,38 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
     task.active = false;
 }
 
+// Splits `samples` into an nx*ny grid as close to square as possible (nx*ny ==
+// samples exactly whenever samples has a divisor near its sqrt — true for every
+// spp value this renderer actually uses: 4=2x2, 8=2x4, 16=4x4, 64=8x8). Primes
+// degrade to a 1xN strip, which still stratifies one axis — acceptable since AA
+// quality at those spp values isn't a target.
+static void stratifiedGridDims(int samples, int& nx, int& ny) {
+    nx = std::max(1, (int)std::lround(std::sqrt((double)samples)));
+    while (nx > 1 && samples % nx != 0) --nx;
+    ny = samples / nx;
+}
+
+// Sample index `i` (0-based, i.e. pass-1) → jittered sub-pixel offset in
+// [-0.5, 0.5) on each axis. Cell (i % nx, i / nx) of the nx*ny grid is jittered
+// uniformly within its cell — stratified sampling: every pass covers a
+// different region of the pixel, so N passes cover the whole pixel exactly
+// once instead of clumping like N independent random offsets would.
+static void stratifiedJitter(int i, int nx, int ny, std::mt19937& rng, float& jx, float& jy) {
+    static std::uniform_real_distribution<float> jit01(0.0f, 1.0f);
+    int cellX = i % nx;
+    int cellY = i / nx;
+    float cellW = 1.0f / (float)nx;
+    float cellH = 1.0f / (float)ny;
+    jx = -0.5f + (cellX + jit01(rng)) * cellW;
+    jy = -0.5f + (cellY + jit01(rng)) * cellH;
+}
+
 // ── Animation: single frame to full convergence ───────────────────────────────
-// Accumulates `samples` passes (pass 1 = no jitter, passes 2+ = ±0.5 px jitter),
-// applies bloom+tonemap, writes outPath. Prints per-sample progress with \r.
+// Accumulates `samples` passes over a stratified nx*ny sub-pixel grid (see
+// stratifiedGridDims/stratifiedJitter above) — this is what makes the pipeline
+// anti-aliased rather than just noise-reduced: each pass's primary ray starts
+// from a different sub-pixel cell, so averaging the passes averages edge
+// coverage. Applies bloom+tonemap, writes outPath. Prints per-sample progress.
 bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
                              int samples, const std::string& outPath) {
     float aspect     = (float)w / (float)h;
@@ -791,7 +1163,12 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
 
     unsigned nThreads = std::max(1u, std::thread::hardware_concurrency());
 
-    // Pass 1: no jitter (seed the accumulation buffer)
+    int gridNx, gridNy;
+    stratifiedGridDims(samples, gridNx, gridNy);
+
+    // Pass 1: sample 0 of the stratified grid (still used to seed the OIDN aux
+    // buffers from an exact pixel-center hit — those are guide images, not part
+    // of the AA average, so they stay unjittered regardless of sample count).
     std::cout << "  sample  1/" << samples << std::flush;
     {
         std::vector<std::thread> threads;
@@ -807,6 +1184,8 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
                 lCtx.primaryInter = &lInter;
                 lCtx.shadowMesh   = &lSMesh;
                 lCtx.shadowInter  = &lSInter;
+
+                std::mt19937 rng((unsigned)(1u * 1000003u) ^ (t * 2654435761u));
 
                 for (int py = (int)t; py < h; py += (int)nThreads) {
                     for (int px = 0; px < w; ++px) {
@@ -835,7 +1214,18 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
                             // glass hit: leave auxAlbedo at kBg default
                         }
 
-                        accumHDR[py*w+px] = sTraceRay(ray, 4, lCtx);
+                        // Color contribution uses cell 0 of the stratified grid, not the
+                        // exact center ray above — keeps sample 1 part of the AA coverage.
+                        float jx, jy;
+                        stratifiedJitter(0, gridNx, gridNy, rng, jx, jy);
+                        float cNdcX = (2.0f*(px+0.5f+jx)/w - 1.0f) * aspect * tanHalfFov;
+                        float cNdcY = (1.0f - 2.0f*(py+0.5f+jy)/h) * tanHalfFov;
+                        glm::vec3 crd = glm::normalize(cam.Front + cNdcX*cam.Right + cNdcY*cam.Up);
+                        nanort::Ray<float> cray;
+                        cray.org[0]=cam.Position.x; cray.org[1]=cam.Position.y; cray.org[2]=cam.Position.z;
+                        cray.dir[0]=crd.x; cray.dir[1]=crd.y; cray.dir[2]=crd.z;
+                        cray.min_t=0.001f; cray.max_t=1.0e30f;
+                        accumHDR[py*w+px] = sTraceRay(cray, 4, lCtx);
                     }
                 }
             });
@@ -843,7 +1233,8 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
         for (auto& th : threads) th.join();
     }
 
-    // Passes 2..samples: jittered AA
+    // Passes 2..samples: stratified-jittered AA — each pass samples a different
+    // cell of the nx*ny grid, so the accumulated average covers the whole pixel.
     for (int s = 2; s <= samples; ++s) {
         std::cout << "\r  sample " << s << "/" << samples << std::flush;
         std::vector<std::thread> threads;
@@ -861,10 +1252,10 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
                 lCtx.shadowInter  = &lSInter;
 
                 std::mt19937 rng((unsigned)(s * 1000003u) ^ (t * 2654435761u));
-                std::uniform_real_distribution<float> jit(-0.5f, 0.5f);
                 for (int py = (int)t; py < h; py += (int)nThreads) {
                     for (int px = 0; px < w; ++px) {
-                        float jx = jit(rng), jy = jit(rng);
+                        float jx, jy;
+                        stratifiedJitter(s - 1, gridNx, gridNy, rng, jx, jy);
                         float ndcX = (2.0f*(px+0.5f+jx)/w - 1.0f) * aspect * tanHalfFov;
                         float ndcY = (1.0f - 2.0f*(py+0.5f+jy)/h) * tanHalfFov;
                         glm::vec3 rd = glm::normalize(cam.Front + ndcX*cam.Right + ndcY*cam.Up);
@@ -910,6 +1301,42 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
     }
     if (!stbi_write_png(outPath.c_str(), w, h, 3, pngBuf.data(), w * 3)) {
         std::cerr << "[RayTracer] Frame write failed: " << outPath << "\n";
+        return false;
+    }
+    return true;
+}
+
+// ── GPU-preview post-process (CP5) — mirrors renderFrame's tail exactly ───────
+bool RayTracer::postProcessAndSave(std::vector<glm::vec3>& hdr,
+                                   std::vector<glm::vec3>& albedo,
+                                   std::vector<glm::vec3>& normal,
+                                   int w, int h, float exposure,
+                                   const std::string& outPath) {
+    for (auto& c : hdr) c *= exposure;
+
+#ifdef HAS_OIDN
+    if (m_oidn.enabled) {
+        std::cout << "  [OIDN] denoising...\n" << std::flush;
+        applyOIDN(hdr, albedo, normal, w, h);
+    }
+#endif
+
+    if (m_bloom.enabled)
+        applyBloomCPU(hdr, w, h, m_bloom.threshold, m_bloom.knee,
+                      m_bloom.iterations, m_bloom.intensity);
+
+    std::vector<uint8_t> pngBuf(w * h * 3);
+    for (int i = 0; i < w * h; ++i) {
+        glm::vec3 c = tonemapACES(hdr[i]);
+        c.r = std::pow(c.r, 1.0f/2.2f);
+        c.g = std::pow(c.g, 1.0f/2.2f);
+        c.b = std::pow(c.b, 1.0f/2.2f);
+        pngBuf[i*3+0] = (uint8_t)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
+        pngBuf[i*3+1] = (uint8_t)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
+        pngBuf[i*3+2] = (uint8_t)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+    }
+    if (!stbi_write_png(outPath.c_str(), w, h, 3, pngBuf.data(), w * 3)) {
+        std::cerr << "[RayTracer] postProcessAndSave: write failed: " << outPath << "\n";
         return false;
     }
     return true;
