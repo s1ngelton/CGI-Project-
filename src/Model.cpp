@@ -170,6 +170,13 @@ void Model::loadPBRMaps(const std::string& normalPath,
     }
 }
 
+void Model::loadDiffuseMap(const std::string& diffusePath) {
+    if (diffusePath.empty()) return;
+    unsigned int did = loadTexture(diffusePath);
+    if (!did) return;
+    for (Mesh& m : m_meshes) m.diffuseTexID = did;
+}
+
 void Model::processNode(aiNode* node, const aiScene* scene) {
     for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
         aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];

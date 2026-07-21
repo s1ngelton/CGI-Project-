@@ -3,12 +3,18 @@
 #include <algorithm>
 
 // ─── Procedural box builder ───────────────────────────────────────────────────
+// uvScale = world metres per texture repeat. Planar-mapped per face from the
+// face's dominant axis, with a matching per-face tangent — only matters for
+// meshes that actually get a diffuse/normal texture assigned afterwards
+// (e.g. via Model::loadDiffuseMap/loadPBRMaps); untextured callers are
+// unaffected since hasTexture/hasNormalTex stay false without a bound map.
 static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
                     glm::vec3 albedo,
                     glm::vec3 emissive      = glm::vec3(0.0f),
                     float     emissStrength = 0.0f,
                     float     roughness     = 0.5f,
-                    float     metallic      = 0.0f)
+                    float     metallic      = 0.0f,
+                    float     uvScale       = 1.0f)
 {
     struct Face { glm::vec3 n; glm::vec3 v[4]; };
 
@@ -31,12 +37,22 @@ static Mesh makeBox(glm::vec3 lo, glm::vec3 hi,
     idx.reserve(36);
 
     for (auto& f : faces) {
+        // Planar-project onto the two world axes orthogonal to this face's normal.
+        glm::vec3 absN = glm::abs(f.n);
+        glm::vec3 uAxis = (absN.x >= absN.y && absN.x >= absN.z) ? glm::vec3(0,0,1)
+                         : (absN.y >= absN.x && absN.y >= absN.z) ? glm::vec3(1,0,0)
+                         : glm::vec3(1,0,0);
+        glm::vec3 vAxis = (absN.x >= absN.y && absN.x >= absN.z) ? glm::vec3(0,1,0)
+                         : (absN.y >= absN.x && absN.y >= absN.z) ? glm::vec3(0,0,1)
+                         : glm::vec3(0,1,0);
+
         auto base = (unsigned int)verts.size();
         for (int i = 0; i < 4; ++i) {
             Vertex vt;
             vt.Position  = f.v[i];
             vt.Normal    = f.n;
-            vt.TexCoords = glm::vec2(0.0f);
+            vt.TexCoords = glm::vec2(glm::dot(f.v[i], uAxis), glm::dot(f.v[i], vAxis)) / uvScale;
+            vt.Tangent   = uAxis;
             verts.push_back(vt);
         }
         idx.insert(idx.end(), {base,base+1,base+2, base,base+2,base+3});
@@ -55,10 +71,11 @@ static SceneObject boxObj(glm::vec3 lo, glm::vec3 hi,
                           glm::vec3 emissive      = glm::vec3(0.0f),
                           float     emissStrength = 0.0f,
                           float     roughness     = 0.5f,
-                          float     metallic      = 0.0f)
+                          float     metallic      = 0.0f,
+                          float     uvScale       = 1.0f)
 {
     SceneObject o;
-    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength, roughness, metallic));
+    o.model.addMesh(makeBox(lo, hi, albedo, emissive, emissStrength, roughness, metallic, uvScale));
     return o;
 }
 
@@ -95,9 +112,18 @@ void Scene::load(const std::string& /*path*/) {
     // ── 2. Room floor (lit from above — no self-emission) ─────────────────────
     objects.push_back(boxObj(
         {-3.0f, 0.0f, -2.0f}, {3.0f, 0.005f, 2.0f},
-        {0.15f, 0.10f, 0.08f},
-        glm::vec3(0.0f), 0.0f, 0.6f, 0.0f));
+        {0.15f, 0.10f, 0.08f},              // fallback albedo if the texture fails to load
+        glm::vec3(0.0f), 0.0f, 0.6f, 0.0f,
+        1.5f));                             // uvScale: 1.5 m per plank-texture tile
     objects.back().skipReflection = true;
+    objects.back().model.loadDiffuseMap("assets/models/Textures/textures/raw_plank_wall_diff_4k.jpg");
+    objects.back().model.loadPBRMaps(
+        "assets/models/Textures/textures/raw_plank_wall_nor_gl_4k.png",
+        "assets/models/Textures/textures/raw_plank_wall_rough_4k.png",
+        "", "");   // no metallic/AO maps in this set — wood floor is non-metallic
+    // GPU texture handles above are unreadable from the CPU ray tracer — it
+    // needs its own copy (same pattern as the chair's Sofa_baseColor.png).
+    objects.back().model.loadCPUAlbedo("assets/models/Textures/textures/raw_plank_wall_diff_4k.jpg");
 
     // ── 3. Vertical corner posts ──────────────────────────────────────────────
     const glm::vec2 corners[4] = {{-3,-2},{3,-2},{3,2},{-3,2}};
@@ -126,12 +152,41 @@ void Scene::load(const std::string& /*path*/) {
     objects.push_back(boxObj({-3.f-H,-H,-2.f},{-3.f+H,H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
     objects.push_back(boxObj({ 3.f-H,-H,-2.f},{ 3.f+H,H,2.f}, kFrameAlb,glm::vec3(0.0f),0.0f,kFrameRough,kFrameMetal));
 
-    // ── 7. Ceiling light panel ────────────────────────────────────────────────
+    // ── 7. Ceiling light panel — 3×3 grid of lit squares, divided by the same
+    //      brushed-metal bar style as the wall mullions/frame ────────────────
     // emissiveStrength 5.0 → well above bloom threshold, strong warm-white glow
-    objects.push_back(boxObj(
-        {-2.7f, 2.93f, -1.7f}, {2.7f, 2.95f, 1.7f},
-        {1.0f, 1.0f, 1.0f},
-        kCeilEmit, 5.0f));
+    {
+        const float lx0 = -2.7f, lx1 = 2.7f;   // same overall footprint as before
+        const float lz0 = -1.7f, lz1 = 1.7f;
+        const float barW  = 2.0f * H;
+        const int   kGrid = 3;
+        const float cellW = (lx1 - lx0 - (kGrid - 1) * barW) / kGrid;
+        const float cellD = (lz1 - lz0 - (kGrid - 1) * barW) / kGrid;
+
+        // colX[i]/rowZ[i] = start edge of cell i (cell spans [start, start+cellW/D])
+        float colX[kGrid], rowZ[kGrid];
+        for (int i = 0; i < kGrid; ++i) {
+            colX[i] = lx0 + i * (cellW + barW);
+            rowZ[i] = lz0 + i * (cellD + barW);
+        }
+
+        for (int cx = 0; cx < kGrid; ++cx)
+            for (int cz = 0; cz < kGrid; ++cz)
+                objects.push_back(boxObj(
+                    {colX[cx], 2.93f, rowZ[cz]}, {colX[cx] + cellW, 2.95f, rowZ[cz] + cellD},
+                    {1.0f, 1.0f, 1.0f}, kCeilEmit, 5.0f));
+
+        // Dividing bars, each spanning the full light footprint so the grid
+        // reads as one frame — same material as the wall frame/mullions.
+        for (int i = 1; i < kGrid; ++i)
+            objects.push_back(boxObj(
+                {colX[i] - barW, 2.93f, lz0}, {colX[i], 2.95f, lz1},
+                kFrameAlb, glm::vec3(0.0f), 0.0f, kFrameRough, kFrameMetal));
+        for (int i = 1; i < kGrid; ++i)
+            objects.push_back(boxObj(
+                {lx0, 2.93f, rowZ[i] - barW}, {lx1, 2.95f, rowZ[i]},
+                kFrameAlb, glm::vec3(0.0f), 0.0f, kFrameRough, kFrameMetal));
+    }
 
     // ── 8. Glass panels (forward transparent pass, not in G-buffer) ───────────
     // Panes are 2 mm thick, centred in the plane of each wall.

@@ -5,6 +5,7 @@ build/
 external/glad/
 external/imgui/
 external/stb/
+external/oidn/
 
 # macOS
 .DS_Store

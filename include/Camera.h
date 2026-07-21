@@ -50,7 +50,9 @@ public:
     // Allow cinematic engine to override position + orientation directly
     void SetPose(glm::vec3 pos, glm::vec3 front) {
         Position = pos;
-        Front    = glm::normalize(front);
+        glm::vec3 f = glm::normalize(front);
+        Pitch = glm::degrees(asin(glm::clamp(f.y, -1.0f, 1.0f)));
+        Yaw   = glm::degrees(atan2(f.z, f.x));
         updateVectors();
     }
 

@@ -31,6 +31,11 @@ if (NOT OpenAL_FOUND)
 endif()
 
 # Intel Open Image Denoise — optional CPU denoiser for the ray tracer path
+# Vendored like glad/imgui/stb: place the prebuilt release in external/oidn/
+# (each dev sets this up themselves — see external/oidn/ in .gitignore).
+if(EXISTS ${CMAKE_SOURCE_DIR}/external/oidn)
+    list(APPEND CMAKE_PREFIX_PATH ${CMAKE_SOURCE_DIR}/external/oidn)
+endif()
 find_package(OpenImageDenoise QUIET)
 
 # ─────────────────────────────────────────────
@@ -118,6 +123,11 @@ endif()
 if(OpenImageDenoise_FOUND)
     list(APPEND LINK_LIBS OpenImageDenoise)
     target_compile_definitions(HorrorEngine PRIVATE HAS_OIDN)
+    # The vendored .so files (OIDN + its bundled TBB/SYCL/etc.) aren't in a
+    # system library path, so the built binary needs an rpath to find them
+    # at runtime without requiring LD_LIBRARY_PATH to be set manually.
+    set_target_properties(HorrorEngine PROPERTIES
+        BUILD_RPATH ${CMAKE_SOURCE_DIR}/external/oidn/lib)
 endif()
 
 target_link_libraries(HorrorEngine PRIVATE ${LINK_LIBS})

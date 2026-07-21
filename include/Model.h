@@ -113,6 +113,10 @@ public:
                      const std::string& metalPath,
                      const std::string& aoPath);
 
+    // Assign a GL diffuse/albedo texture explicitly (for procedural meshes,
+    // e.g. the room's boxObj floor, which have no MTL to reference one).
+    void loadDiffuseMap(const std::string& diffusePath);
+
 private:
     std::vector<Mesh>                    m_meshes;
     std::string                          m_directory;

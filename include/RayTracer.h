@@ -43,6 +43,51 @@ struct BloomSettings {
     float intensity  = 0.04f;
 };
 
+// Volumetric single-scattering ("50P Cat-3" item) — ray-marched participating medium
+// added on top of the existing surface shading. enabled=false or both densities<=0 must
+// be an exact no-op (identical output to before this feature existed).
+// The march covers two independently-tunable spans along each primary ray:
+//   - exterior: the portion of camera -> first glass hit (or, for rays that miss all
+//     geometry, camera -> maxDistance) that falls WITHIN a bounded spherical "atmosphere
+//     pocket" around the room (exteriorVolumeCenter/Radius). Clipping to this sphere is
+//     what makes the exterior glow look the same at any camera distance — without it, a
+//     far camera marches a much longer span than a close one and Beer-Lambert piles up
+//     proportionally more haze, smoking out distant shots.
+//   - interior: first glass hit -> first opaque surface (the room's actual air), only
+//     present when the first hit is glass. Already distance-invariant since it's measured
+//     from the glass surface, not the camera.
+// extinction/scatterStrength/g and the per-step shadow rays are shared by both spans.
+struct VolumetricSettings {
+    bool  enabled              = false;
+    float interiorDensity      = 0.15f;  // fog amount inside the glass box, 0 = off
+    float exteriorDensity      = 0.15f;  // fog amount in the atmosphere pocket, 0 = off
+    float extinction           = 0.15f;  // Beer-Lambert decay rate (per metre), shared
+    float scatterStrength      = 1.0f;   // brightness multiplier on in-scattered light, shared
+    int   interiorStepCount    = 24;     // march samples for the interior span
+    int   exteriorStepCount    = 24;     // march samples for the exterior span — tune for cost
+    float maxDistance          = 20.0f;  // march cap for rays that miss all geometry entirely
+    float g                    = 0.0f;   // Henyey-Greenstein asymmetry, shared
+    glm::vec3 exteriorVolumeCenter = { 0.0f, 1.5f, 0.0f };  // room-centre sphere for the pocket
+    float     exteriorVolumeRadius = 5.22f;                 // tuned against the push-in shot —
+                                                             // must stay tight or distant cameras still
+                                                             // march most of their camera-to-glass span
+};
+
+// Color grade + vignette + tonemap op — mirrors Renderer::Settings / tonemap.frag
+// EXACTLY so the look tuned live in the raster preview carries into the CPU
+// ray-traced final render unchanged. Applied in the same order as the shader:
+// exposure (already applied by caller) -> colorGrade (linear) -> tonemap -> gamma -> vignette.
+struct ColorGradeSettings {
+    bool      enabled          = false;
+    float     temperature      = 0.0f;   // -1 (cool/blue) .. +1 (warm/orange)
+    glm::vec3 tint             = glm::vec3(1.0f);
+    float     saturation       = 1.0f;   // 0 = greyscale, 1 = identity, 2 = hyper
+    glm::vec3 shadowLift       = glm::vec3(0.0f);
+    float     vignetteStrength = 0.0f;   // 0 = off, 1 = max
+    float     vignetteSoftness = 0.45f;
+    int       tonemapOp        = 0;      // 0 = ACES filmic, 1 = Reinhard
+};
+
 // ── Animation shot parameters — edit these to change the push-in ──────────────
 // Camera moves from startPos to endPos over numFrames, always looking at lookAt.
 // t is smoothstepped (slow in / slow out). At 30 fps: numFrames/30 = seconds.
@@ -55,6 +100,48 @@ struct AnimConfig {
     int         numFrames = 60;   // 2 s at 30 fps — bump to 120 for 4 s
     int         spp       = 4;    // samples per frame (set to 1 for a quick preview)
     std::string outDir    = "frames";
+};
+
+// A single camera pose along a multi-keyframe cinematic shot.
+struct CameraKeyframe {
+    glm::vec3 pos;
+    glm::vec3 lookAt;
+    float     durationSec = 0.0f;  // time to travel from the PREVIOUS keyframe to this
+                                    // one; ignored for keyframes[0] (the shot's start pose)
+};
+
+// Multi-keyframe camera path — a choreographed shot with several moves and a changing
+// look-at target, vs. AnimConfig's single start->end push-in. Segment i is
+// keyframes[i-1] -> keyframes[i]; each segment interpolates BOTH pos and lookAt
+// (as 3D points, not angles — sidesteps gimbal issues and makes re-targeting the
+// look-at, e.g. room-centre -> phone, a simple point mix) with its own smoothstep
+// ease-in/ease-out, so the shot reads as distinct beats rather than one continuous
+// curve. Frame count is derived from total segment duration * fps.
+//
+// Real keyframes captured via the C key (fly to each pose, press C, copy pos/lookAt).
+// Pose 5's look-at is the phone's actual world-space AABB centre (printed at startup as
+// "[Phone World Center]") rather than pos+front*3 — that overshot since the phone sits
+// closer than 3m from pose 5, which put the naive look-at below floor level.
+// Segment durations below are the original 6/8/6/4 (24s total) scaled by 50/24 so the
+// total is 50s at 24fps (1200 frames) — every beat is proportionally slower/more
+// deliberate, not just padded at the end.
+struct AnimPath {
+    std::vector<CameraKeyframe> keyframes = {
+        // 1. START: looking up at the sky/ceiling void, room not yet in frame
+        { {0.558f, 2.047f, -33.883f}, {0.522f, 3.546f, -31.285f}, 0.0f },
+        // 2. TILT DOWN: same position, look-at drops toward room level
+        { {0.558f, 2.047f, -33.883f}, {0.516f, 2.088f, -30.884f}, 12.5f },
+        // 3. PUSH IN / ESTABLISH: translate forward, head-on
+        { {0.954f, 2.126f, -13.908f}, {0.949f, 2.041f, -10.909f}, 16.666667f },
+        // 4. DESCEND to low, level framing
+        { {0.905f, 1.231f, -2.074f},  {0.951f, 0.760f,  0.888f},  12.5f },
+        // 5. RE-FRAME onto the phone for the close-up
+        { {1.134f, 0.862f, -0.219f},  {1.4f,   0.582922f, 0.3f},  8.333333f },
+    };
+    float       fovDeg = 35.0f;
+    int         fps    = 24;
+    int         spp    = 8;
+    std::string outDir = "frames";
 };
 
 // Point light as seen by the CPU ray tracer — identical values to kCeilLights in Renderer.cpp
@@ -103,12 +190,20 @@ public:
     void setBloomSettings(const BloomSettings& s) { m_bloom  = s; }
     void setOIDNSettings (const OIDNSettings&  s) { m_oidn   = s; }
     void setAnimConfig   (const AnimConfig&    c) { m_animCfg = c; }
+    void setAnimPath     (const AnimPath&      p) { m_animPath = p; }
+    void setVolumetricSettings(const VolumetricSettings& s) { m_volumetric = s; }
+    void setColorGradeSettings(const ColorGradeSettings& s) { m_colorGrade = s; }
 
     // ── Animation render ──────────────────────────────────────────────────────
     // Renders numFrames to outDir/frame_XXXX.png, each converged to full spp.
     // Checks cancel between frames — safe to abort mid-sequence (already-saved
     // frames are kept). Call from a std::thread; does not touch GL.
     void renderAnimation(int w, int h, float exposure, std::atomic<bool>& cancel);
+
+    // ── Multi-keyframe cinematic path ─────────────────────────────────────────
+    // Renders m_animPath (set via setAnimPath()) to outDir/frame_XXXX.png. Same
+    // cancel/threading contract as renderAnimation().
+    void renderAnimationPath(int w, int h, float exposure, std::atomic<bool>& cancel);
 
     // glassPassThrough=true → checkpoint (b): glass transparent, BRDF+shadows only.
     // glassPassThrough=false → checkpoint (c): Fresnel reflection+transmission on glass.
@@ -257,7 +352,10 @@ private:
     std::vector<RTLight> m_lights;
     float                m_lightRadius = 8.0f;
 
-    BloomSettings m_bloom;
-    OIDNSettings  m_oidn;
-    AnimConfig    m_animCfg;
+    BloomSettings       m_bloom;
+    OIDNSettings        m_oidn;
+    AnimConfig          m_animCfg;
+    AnimPath            m_animPath;
+    VolumetricSettings  m_volumetric;
+    ColorGradeSettings  m_colorGrade;
 };

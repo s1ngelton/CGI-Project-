@@ -371,6 +371,53 @@ static glm::vec3 tonemapACES(glm::vec3 x) {
     return glm::clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0f, 1.0f);
 }
 
+static glm::vec3 tonemapReinhard(glm::vec3 x) {
+    return x / (x + glm::vec3(1.0f));
+}
+
+// Verbatim port of tonemap.frag's colorGrade() — operates in linear HDR space, before tonemap.
+static glm::vec3 sColorGrade(glm::vec3 c, const ColorGradeSettings& g) {
+    c.r *= 1.0f + g.temperature * 0.3f;
+    c.b *= 1.0f - g.temperature * 0.3f;
+    c    = glm::max(c, glm::vec3(0.0f));
+
+    c *= g.tint;
+
+    float grey = glm::dot(c, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+    c += g.shadowLift * std::max(0.0f, 1.0f - grey);
+
+    float luma = glm::dot(c, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+    c = glm::mix(glm::vec3(luma), c, g.saturation);
+
+    return glm::max(c, glm::vec3(0.0f));
+}
+
+// Verbatim port of tonemap.frag's vignette — multiplicative darkening AFTER gamma,
+// radially symmetric around UV (0.5,0.5) so it's unaffected by V-axis orientation.
+static glm::vec3 sVignette(glm::vec3 c, float u, float v, float strength, float softness) {
+    float r        = glm::length(glm::vec2(u, v) - glm::vec2(0.5f));
+    float vignette = 1.0f - strength * glm::smoothstep(softness * 0.7071f, 0.7071f, r);
+    return c * vignette;
+}
+
+// Full post-process chain mirroring tonemap.frag exactly: color grade (linear) ->
+// tonemap -> sRGB gamma -> vignette. `hdrExposed` must already have exposure applied
+// by the caller (each call site handles exposure differently upstream). (u,v) in [0,1].
+static glm::vec3 sPostProcess(glm::vec3 hdrExposed, float u, float v, const ColorGradeSettings& g) {
+    glm::vec3 c = hdrExposed;
+    if (g.enabled) c = sColorGrade(c, g);
+
+    c = (g.tonemapOp == 0) ? tonemapACES(c) : tonemapReinhard(c);
+
+    c.r = std::pow(c.r, 1.0f / 2.2f);
+    c.g = std::pow(c.g, 1.0f / 2.2f);
+    c.b = std::pow(c.b, 1.0f / 2.2f);
+
+    if (g.vignetteStrength > 0.0f) c = sVignette(c, u, v, g.vignetteStrength, g.vignetteSoftness);
+
+    return glm::clamp(c, 0.0f, 1.0f);
+}
+
 // ── Checkpoint (c): recursive ray trace context ───────────────────────────────
 // Bundles all BVH/mesh/intersector pointers so sTraceRay can be a static free function.
 struct TraceCtx {
@@ -387,6 +434,7 @@ struct TraceCtx {
     glm::vec3                                  background;
     // Checkpoint selector: true = (b) pass-through glass, false = (c) Fresnel reflections
     bool                                       glassPassThrough = false;
+    VolumetricSettings                         volumetric;
 };
 
 // Forward declaration (function is recursive)
@@ -516,6 +564,192 @@ static glm::vec3 sTraceRay(const nanort::Ray<float>& ray, int depth, const Trace
 
     // Emissive — additive, bypasses shadow/BRDF
     return Lo + mesh->emissiveColor * mesh->emissiveStrength;
+}
+
+// ── Volumetric single-scattering (50P Cat-3) ──────────────────────────────────
+// The room is a fully glassed cube and the usual cameras sit outside it, so the
+// primary ray's first BVH hit is almost always the windowpane itself. Marching
+// only from the camera to that first hit would fog just the sliver of air in
+// front of the glass — not the room interior behind it, where the chair/frame
+// actually occlude the ceiling lights. This walks past glass hits (same
+// continuation pattern as the glassPassThrough branch in sTraceRay above) to
+// find the first truly opaque surface, and marches that full distance instead.
+static float sFindOpaqueDistance(const nanort::Ray<float>& ray, const TraceCtx& ctx) {
+    glm::vec3 rd(ray.dir[0], ray.dir[1], ray.dir[2]);
+    nanort::Ray<float> r = ray;
+    float traveled = 0.0f;
+
+    for (int bounce = 0; bounce < 8; ++bounce) {
+        nanort::TriangleIntersection<float> isect;
+        if (!ctx.primaryBVH->Traverse(r, *ctx.primaryInter, &isect, ctx.opts))
+            return ctx.volumetric.maxDistance;   // exits the structure entirely
+
+        float hitDist = traveled + isect.t;
+        const RTTriangle& tri = (*ctx.tris)[isect.prim_id];
+        if (!tri.isGlass)
+            return hitDist;
+
+        glm::vec3 org(r.org[0], r.org[1], r.org[2]);
+        glm::vec3 hitPos = org + rd * isect.t;
+        float     eps    = std::max(0.005f, isect.t * 1e-4f);
+        glm::vec3 newOrg = hitPos + rd * eps;
+
+        traveled = hitDist + eps;
+        r.org[0] = newOrg.x; r.org[1] = newOrg.y; r.org[2] = newOrg.z;
+        r.min_t  = 0.0f;     r.max_t  = 1.0e30f;
+    }
+    return ctx.volumetric.maxDistance;   // exceeded the glass-bounce budget
+}
+
+// Splits a primary ray into the exterior span (camera -> first hit) and, if that first
+// hit is glass, the interior span (glass entry -> first opaque surface, reusing
+// sFindOpaqueDistance's total-distance-from-camera result so the glass-walking loop
+// isn't duplicated). Rays that miss all geometry are treated as pure void: the exterior
+// span covers the full maxDistance and there is no interior span.
+static void sFindMarchSegments(const nanort::Ray<float>& ray, const TraceCtx& ctx,
+                                float& exteriorDist, bool& hasInterior, float& interiorDist) {
+    nanort::TriangleIntersection<float> isect;
+    if (!ctx.primaryBVH->Traverse(ray, *ctx.primaryInter, &isect, ctx.opts)) {
+        exteriorDist = ctx.volumetric.maxDistance;
+        hasInterior  = false;
+        interiorDist = 0.0f;
+        return;
+    }
+
+    exteriorDist = isect.t;
+    const RTTriangle& tri = (*ctx.tris)[isect.prim_id];
+    if (!tri.isGlass) {
+        hasInterior  = false;
+        interiorDist = 0.0f;
+        return;
+    }
+
+    hasInterior         = true;
+    float totalOpaque   = sFindOpaqueDistance(ray, ctx);
+    interiorDist         = std::max(0.0f, totalOpaque - exteriorDist);
+}
+
+// Stage 3: Henyey-Greenstein phase function. cosTheta = dot(rayDir, lightDir) where
+// rayDir is the camera ray's travel direction and lightDir points from the sample
+// toward the light. g > 0 peaks at cosTheta = +1, i.e. when the camera ray keeps
+// going roughly toward the light — forward scattering, brightening the haze when
+// looking toward a light through it. g = 0 reduces to the Stage 1/2 isotropic term.
+static float sHenyeyGreenstein(float cosTheta, float g) {
+    if (std::abs(g) < 1e-4f) return 1.0f / (4.0f * kPI);
+    float g2    = g * g;
+    float denom = 1.0f + g2 - 2.0f * g * cosTheta;
+    return (1.0f - g2) / (4.0f * kPI * denom * std::sqrt(std::max(denom, 1e-6f)));
+}
+
+// Ray-sphere intersection, clamped so a camera already inside the sphere still gets a
+// valid [0, tExit] segment instead of a negative tEnter. Returns false if the ray never
+// enters the sphere (misses it, or the sphere is entirely behind the ray origin).
+static bool sRaySphereIntersect(const glm::vec3& org, const glm::vec3& dir,
+                                 const glm::vec3& center, float radius,
+                                 float& tEnter, float& tExit) {
+    glm::vec3 oc   = org - center;
+    float     b    = glm::dot(oc, dir);          // dir assumed normalized (a = 1)
+    float     c    = glm::dot(oc, oc) - radius * radius;
+    float     disc = b * b - c;
+    if (disc < 0.0f) return false;
+    float sq = std::sqrt(disc);
+    float t0 = -b - sq, t1 = -b + sq;
+    if (t1 < 0.0f) return false;
+    tEnter = std::max(0.0f, t0);
+    tExit  = t1;
+    return true;
+}
+
+// Homogeneous single-scattering march: Stage 1's glow, Stage 2's shadow-ray shafts,
+// Stage 3's Henyey-Greenstein phase, and the exterior/interior split all live here.
+// enabled=false or both densities<=0 must return sTraceRay's result completely unchanged.
+//
+// The ray is marched in two back-to-back spans, near (camera) to far, sharing a single
+// running transmittance/inscatter accumulator so attenuation composites correctly across
+// the boundary: exterior (the void in front of/around the glass box) first, then interior
+// (the box's actual air), each with its own density and step count.
+static glm::vec3 sTraceRayVolumetric(const nanort::Ray<float>& ray, const TraceCtx& ctx) {
+    glm::vec3 surface = sTraceRay(ray, 4, ctx);
+    const VolumetricSettings& vs = ctx.volumetric;
+    if (!vs.enabled || (vs.interiorDensity <= 0.0f && vs.exteriorDensity <= 0.0f))
+        return surface;
+
+    float exteriorDist; bool hasInterior; float interiorDist;
+    sFindMarchSegments(ray, ctx, exteriorDist, hasInterior, interiorDist);
+
+    glm::vec3 org(ray.org[0], ray.org[1], ray.org[2]);
+    glm::vec3 rd (ray.dir[0], ray.dir[1], ray.dir[2]);
+
+    glm::vec3 inscatter(0.0f);
+    float     transmittance = 1.0f;
+
+    auto marchSpan = [&](float spanStart, float spanLen, int stepCount, float density) {
+        if (spanLen <= 0.0f || density <= 0.0f) return;
+        int   steps = std::max(1, stepCount);
+        float dt    = spanLen / (float)steps;
+
+        for (int i = 0; i < steps; ++i) {
+            glm::vec3 p = org + rd * (spanStart + (i + 0.5f) * dt);   // sample at step midpoint
+
+            glm::vec3 Lscat(0.0f);
+            for (const RTLight& light : *ctx.lights) {
+                glm::vec3 toLight = light.position - p;
+                float     d       = glm::length(toLight);
+                if (d < 1e-6f) continue;
+                glm::vec3 Li = toLight / d;
+
+                // Stage 2: any-hit shadow ray, same pattern as the surface BRDF loop
+                // above — air in the shadow of the frame/chair gets no in-scatter
+                // from this light, which is what produces the visible light shafts.
+                if (ctx.shadowBVH) {
+                    glm::vec3 shadowOrg = p + Li * 0.01f;
+                    nanort::Ray<float> shadowRay;
+                    shadowRay.org[0]=shadowOrg.x; shadowRay.org[1]=shadowOrg.y; shadowRay.org[2]=shadowOrg.z;
+                    shadowRay.dir[0]=Li.x;        shadowRay.dir[1]=Li.y;        shadowRay.dir[2]=Li.z;
+                    shadowRay.min_t=0.0f;
+                    shadowRay.max_t=d - 0.02f;
+
+                    nanort::TriangleIntersection<float> shadowIsect;
+                    if (ctx.shadowBVH->Traverse(shadowRay, *ctx.shadowInter, &shadowIsect, ctx.opts))
+                        continue;   // occluded — no in-scatter from this light at this step
+                }
+
+                // Same windowed-quadratic falloff as the surface BRDF loop, so the
+                // in-scatter term visually agrees with direct surface lighting.
+                float dist2 = d * d;
+                float att2  = dist2 / (ctx.lightRadius * ctx.lightRadius);
+                float att   = std::max(0.0f, 1.0f - att2);
+                att        *= att;
+
+                float phase = sHenyeyGreenstein(glm::dot(rd, Li), vs.g);
+                Lscat += light.color * att * light.intensity * phase;
+            }
+
+            glm::vec3 stepInscatter = density * vs.scatterStrength * Lscat * dt;
+            inscatter     += transmittance * stepInscatter;
+            transmittance *= std::exp(-vs.extinction * dt);   // Beer-Lambert
+        }
+    };
+
+    // Exterior: camera -> first hit (glass or opaque), or the full maxDistance on a pure
+    // miss — clipped to the bounded "atmosphere pocket" sphere so the accumulated haze
+    // along this span has the same length (and therefore the same look) regardless of
+    // how far the camera sits from the room. Without this clip, a distant camera would
+    // march the entire camera-to-box void and over-accumulate fog via Beer-Lambert.
+    float sphereEnter, sphereExit;
+    if (sRaySphereIntersect(org, rd, vs.exteriorVolumeCenter, vs.exteriorVolumeRadius,
+                            sphereEnter, sphereExit)) {
+        float extStart = std::max(0.0f, sphereEnter);
+        float extEnd   = std::min(exteriorDist, sphereExit);
+        if (extEnd > extStart)
+            marchSpan(extStart, extEnd - extStart, vs.exteriorStepCount, vs.exteriorDensity);
+    }
+
+    // Interior: glass entry -> first opaque surface. Only exists when the first hit is glass.
+    if (hasInterior)
+        marchSpan(exteriorDist, interiorDist, vs.interiorStepCount, vs.interiorDensity);
+
+    return surface * transmittance + inscatter;
 }
 
 // ── Diagnostic (read-only, duplicated logic — sTraceRay above is untouched) ──
@@ -785,6 +1019,7 @@ bool RayTracer::renderBeauty(const Camera& cam, int w, int h,
     ctx.lightRadius      = m_lightRadius;
     ctx.background       = kBackground;
     ctx.glassPassThrough = glassPassThrough;
+    ctx.volumetric       = m_volumetric;
 
     std::vector<glm::vec3> hdr(w * h, kBackground);
 
@@ -816,7 +1051,7 @@ bool RayTracer::renderBeauty(const Camera& cam, int w, int h,
                         ray.org[0]=cam.Position.x; ray.org[1]=cam.Position.y; ray.org[2]=cam.Position.z;
                         ray.dir[0]=rd.x;           ray.dir[1]=rd.y;           ray.dir[2]=rd.z;
                         ray.min_t=0.001f; ray.max_t=1.0e30f;
-                        hdr[py*w+px] = sTraceRay(ray, 4, lCtx);
+                        hdr[py*w+px] = sTraceRayVolumetric(ray, lCtx);
                     }
                 }
             });
@@ -825,16 +1060,14 @@ bool RayTracer::renderBeauty(const Camera& cam, int w, int h,
     }
     std::cout << "[RayTracer] Beauty: 100% — tonemapping...\n";
 
-    // Tonemap + sRGB gamma (mirrors tonemap.frag: ACES, exposure, pow(1/2.2))
+    // Color grade + tonemap + sRGB gamma + vignette (mirrors tonemap.frag exactly)
     std::vector<uint8_t> pixels(w * h * 3);
     for (int i = 0; i < w * h; ++i) {
-        glm::vec3 c = tonemapACES(hdr[i] * exposure);
-        c.r = std::pow(c.r, 1.0f / 2.2f);
-        c.g = std::pow(c.g, 1.0f / 2.2f);
-        c.b = std::pow(c.b, 1.0f / 2.2f);
-        pixels[i*3+0] = (uint8_t)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
-        pixels[i*3+1] = (uint8_t)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
-        pixels[i*3+2] = (uint8_t)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+        float u = ((i % w) + 0.5f) / w, v = ((i / w) + 0.5f) / h;
+        glm::vec3 c = sPostProcess(hdr[i] * exposure, u, v, m_colorGrade);
+        pixels[i*3+0] = (uint8_t)(c.r * 255.0f);
+        pixels[i*3+1] = (uint8_t)(c.g * 255.0f);
+        pixels[i*3+2] = (uint8_t)(c.b * 255.0f);
     }
 
     if (outPixels) *outPixels = pixels;
@@ -937,6 +1170,7 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
     ctx.lightRadius      = m_lightRadius;
     ctx.background       = kBackground;
     ctx.glassPassThrough = glassPassThrough;
+    ctx.volumetric       = m_volumetric;
 
     task.rowsDone = 0;
 
@@ -953,13 +1187,11 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
         float inv = 1.0f / (float)sample;
         std::lock_guard<std::mutex> lk(task.bufMutex);
         for (int i = 0; i < w*h; ++i) {
-            glm::vec3 c = tonemapACES(accumHDR[i] * inv * exposure);
-            c.r = std::pow(c.r, 1.0f/2.2f);
-            c.g = std::pow(c.g, 1.0f/2.2f);
-            c.b = std::pow(c.b, 1.0f/2.2f);
-            task.buf[i*3+0] = (uint8_t)(glm::clamp(c.r,0.0f,1.0f)*255.0f);
-            task.buf[i*3+1] = (uint8_t)(glm::clamp(c.g,0.0f,1.0f)*255.0f);
-            task.buf[i*3+2] = (uint8_t)(glm::clamp(c.b,0.0f,1.0f)*255.0f);
+            float u = ((i % w) + 0.5f) / w, v = ((i / w) + 0.5f) / h;
+            glm::vec3 c = sPostProcess(accumHDR[i] * inv * exposure, u, v, m_colorGrade);
+            task.buf[i*3+0] = (uint8_t)(c.r*255.0f);
+            task.buf[i*3+1] = (uint8_t)(c.g*255.0f);
+            task.buf[i*3+2] = (uint8_t)(c.b*255.0f);
         }
     };
 
@@ -989,19 +1221,17 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
                         ray.org[0]=cam.Position.x; ray.org[1]=cam.Position.y; ray.org[2]=cam.Position.z;
                         ray.dir[0]=rd.x; ray.dir[1]=rd.y; ray.dir[2]=rd.z;
                         ray.min_t=0.001f; ray.max_t=1.0e30f;
-                        accumHDR[py*w+px] = sTraceRay(ray, 4, lCtx);
+                        accumHDR[py*w+px] = sTraceRayVolumetric(ray, lCtx);
                     }
                     {
                         std::lock_guard<std::mutex> lk(task.bufMutex);
                         for (int px = 0; px < w; ++px) {
                             int i = py*w+px;
-                            glm::vec3 c = tonemapACES(accumHDR[i] * exposure);
-                            c.r = std::pow(c.r, 1.0f/2.2f);
-                            c.g = std::pow(c.g, 1.0f/2.2f);
-                            c.b = std::pow(c.b, 1.0f/2.2f);
-                            task.buf[i*3+0] = (uint8_t)(glm::clamp(c.r,0.0f,1.0f)*255.0f);
-                            task.buf[i*3+1] = (uint8_t)(glm::clamp(c.g,0.0f,1.0f)*255.0f);
-                            task.buf[i*3+2] = (uint8_t)(glm::clamp(c.b,0.0f,1.0f)*255.0f);
+                            float u = (px + 0.5f) / w, v = (py + 0.5f) / h;
+                            glm::vec3 c = sPostProcess(accumHDR[i] * exposure, u, v, m_colorGrade);
+                            task.buf[i*3+0] = (uint8_t)(c.r*255.0f);
+                            task.buf[i*3+1] = (uint8_t)(c.g*255.0f);
+                            task.buf[i*3+2] = (uint8_t)(c.b*255.0f);
                         }
                     }
                     ++task.rowsDone;
@@ -1046,7 +1276,7 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
                             ray.org[0]=cam.Position.x; ray.org[1]=cam.Position.y; ray.org[2]=cam.Position.z;
                             ray.dir[0]=rd.x; ray.dir[1]=rd.y; ray.dir[2]=rd.z;
                             ray.min_t=0.001f; ray.max_t=1.0e30f;
-                            accumHDR[py*w+px] += sTraceRay(ray, 4, lCtx);
+                            accumHDR[py*w+px] += sTraceRayVolumetric(ray, lCtx);
                         }
                     }
                 });
@@ -1081,13 +1311,11 @@ void RayTracer::renderBeautyProgressive(const Camera& cam, int w, int h,
 
         std::vector<uint8_t> pngBuf(w * h * 3);
         for (int i = 0; i < w * h; ++i) {
-            glm::vec3 c = tonemapACES(finalHDR[i]);
-            c.r = std::pow(c.r, 1.0f / 2.2f);
-            c.g = std::pow(c.g, 1.0f / 2.2f);
-            c.b = std::pow(c.b, 1.0f / 2.2f);
-            pngBuf[i*3+0] = (uint8_t)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
-            pngBuf[i*3+1] = (uint8_t)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
-            pngBuf[i*3+2] = (uint8_t)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+            float u = ((i % w) + 0.5f) / w, v = ((i / w) + 0.5f) / h;
+            glm::vec3 c = sPostProcess(finalHDR[i], u, v, m_colorGrade);
+            pngBuf[i*3+0] = (uint8_t)(c.r * 255.0f);
+            pngBuf[i*3+1] = (uint8_t)(c.g * 255.0f);
+            pngBuf[i*3+2] = (uint8_t)(c.b * 255.0f);
         }
         if (stbi_write_png(outPath.c_str(), w, h, 3, pngBuf.data(), w * 3))
             std::cout << "[RayTracer] Saved: " << outPath
@@ -1154,6 +1382,7 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
     ctx.lightRadius      = m_lightRadius;
     ctx.background       = kBg;
     ctx.glassPassThrough = false;  // always full Fresnel for final renders
+    ctx.volumetric       = m_volumetric;
 
     std::vector<glm::vec3> accumHDR(w * h, glm::vec3(0.0f));
     // Aux buffers for OIDN: filled once during pass 1 (no-jitter primary hit), then frozen.
@@ -1263,7 +1492,7 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
                         ray.org[0]=cam.Position.x; ray.org[1]=cam.Position.y; ray.org[2]=cam.Position.z;
                         ray.dir[0]=rd.x; ray.dir[1]=rd.y; ray.dir[2]=rd.z;
                         ray.min_t=0.001f; ray.max_t=1.0e30f;
-                        accumHDR[py*w+px] += sTraceRay(ray, 4, lCtx);
+                        accumHDR[py*w+px] += sTraceRayVolumetric(ray, lCtx);
                     }
                 }
             });
@@ -1291,13 +1520,11 @@ bool RayTracer::renderFrame(const Camera& cam, int w, int h, float exposure,
 
     std::vector<uint8_t> pngBuf(w * h * 3);
     for (int i = 0; i < w * h; ++i) {
-        glm::vec3 c = tonemapACES(finalHDR[i]);
-        c.r = std::pow(c.r, 1.0f/2.2f);
-        c.g = std::pow(c.g, 1.0f/2.2f);
-        c.b = std::pow(c.b, 1.0f/2.2f);
-        pngBuf[i*3+0] = (uint8_t)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
-        pngBuf[i*3+1] = (uint8_t)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
-        pngBuf[i*3+2] = (uint8_t)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+        float u = ((i % w) + 0.5f) / w, v = ((i / w) + 0.5f) / h;
+        glm::vec3 c = sPostProcess(finalHDR[i], u, v, m_colorGrade);
+        pngBuf[i*3+0] = (uint8_t)(c.r * 255.0f);
+        pngBuf[i*3+1] = (uint8_t)(c.g * 255.0f);
+        pngBuf[i*3+2] = (uint8_t)(c.b * 255.0f);
     }
     if (!stbi_write_png(outPath.c_str(), w, h, 3, pngBuf.data(), w * 3)) {
         std::cerr << "[RayTracer] Frame write failed: " << outPath << "\n";
@@ -1327,13 +1554,11 @@ bool RayTracer::postProcessAndSave(std::vector<glm::vec3>& hdr,
 
     std::vector<uint8_t> pngBuf(w * h * 3);
     for (int i = 0; i < w * h; ++i) {
-        glm::vec3 c = tonemapACES(hdr[i]);
-        c.r = std::pow(c.r, 1.0f/2.2f);
-        c.g = std::pow(c.g, 1.0f/2.2f);
-        c.b = std::pow(c.b, 1.0f/2.2f);
-        pngBuf[i*3+0] = (uint8_t)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
-        pngBuf[i*3+1] = (uint8_t)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
-        pngBuf[i*3+2] = (uint8_t)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+        float u = ((i % w) + 0.5f) / w, v = ((i / w) + 0.5f) / h;
+        glm::vec3 c = sPostProcess(hdr[i], u, v, m_colorGrade);
+        pngBuf[i*3+0] = (uint8_t)(c.r * 255.0f);
+        pngBuf[i*3+1] = (uint8_t)(c.g * 255.0f);
+        pngBuf[i*3+2] = (uint8_t)(c.b * 255.0f);
     }
     if (!stbi_write_png(outPath.c_str(), w, h, 3, pngBuf.data(), w * 3)) {
         std::cerr << "[RayTracer] postProcessAndSave: write failed: " << outPath << "\n";
@@ -1404,6 +1629,122 @@ void RayTracer::renderAnimation(int w, int h, float exposure, std::atomic<bool>&
                   << "  Quick preview (faster encode, slightly lower quality):\n"
                   << "  ffmpeg -framerate 30 -i " << cfg.outDir << "/frame_%04d.png \\\n"
                   << "         -c:v libx264 -pix_fmt yuv420p -crf 23 -preset fast animation.mp4\n"
+                  << std::flush;
+    }
+}
+
+// Evaluates an AnimPath at time tSec: finds the segment tSec falls in (by cumulative
+// durationSec), smoothsteps the local fraction, and mixes both pos and lookAt as plain
+// 3D points between that segment's two keyframes.
+static void sEvalAnimPath(const AnimPath& path, float tSec, glm::vec3& outPos, glm::vec3& outLookAt) {
+    float acc = 0.0f;
+    for (size_t i = 1; i < path.keyframes.size(); ++i) {
+        float segDur = std::max(path.keyframes[i].durationSec, 1e-6f);
+        bool  isLast = (i == path.keyframes.size() - 1);
+        if (tSec <= acc + segDur || isLast) {
+            float local = glm::clamp((tSec - acc) / segDur, 0.0f, 1.0f);
+            float eased = local * local * (3.0f - 2.0f * local);   // smoothstep
+            outPos    = glm::mix(path.keyframes[i-1].pos,    path.keyframes[i].pos,    eased);
+            outLookAt = glm::mix(path.keyframes[i-1].lookAt, path.keyframes[i].lookAt, eased);
+            return;
+        }
+        acc += segDur;
+    }
+    // Only reachable if keyframes.size() < 2 — fall back to the single available pose.
+    outPos    = path.keyframes.empty() ? glm::vec3(0.0f) : path.keyframes.back().pos;
+    outLookAt = path.keyframes.empty() ? glm::vec3(0.0f) : path.keyframes.back().lookAt;
+}
+
+void RayTracer::renderAnimationPath(int w, int h, float exposure, std::atomic<bool>& cancel) {
+    if (!m_bvh || m_tris.empty() || m_lights.empty()) {
+        std::cerr << "[AnimPath] Scene not ready — call buildScene() and setLights() first.\n";
+        return;
+    }
+
+    const AnimPath& path = m_animPath;
+    if (path.keyframes.size() < 2) {
+        std::cerr << "[AnimPath] Need at least 2 keyframes.\n";
+        return;
+    }
+
+    float totalDur = 0.0f;
+    for (size_t i = 1; i < path.keyframes.size(); ++i) totalDur += path.keyframes[i].durationSec;
+    int N = std::max(1, (int)std::round(totalDur * (float)path.fps));
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.outDir, ec);
+    if (ec) {
+        std::cerr << "[AnimPath] Cannot create output dir '" << path.outDir << "': " << ec.message() << "\n";
+        return;
+    }
+
+    std::cout << "[AnimPath] " << path.keyframes.size() << " keyframes, " << totalDur << "s @ "
+              << path.fps << " fps → " << N << " frames × " << path.spp << " spp → "
+              << path.outDir << "/frame_XXXXX.png\n"
+              << "[AnimPath] R to cancel (keeps already-saved frames; already-rendered\n"
+              << "           frames on disk are skipped on the next run — safe to resume)\n"
+              << std::flush;
+
+    int    saved         = 0;   // frames confirmed on disk this call (rendered or pre-existing)
+    int    renderedNow   = 0;   // frames actually rendered THIS run (for the ETA average)
+    double renderedSecs  = 0.0;
+    for (int f = 0; f < N; ++f) {
+        if (cancel) break;
+
+        char outPath[512];
+        std::snprintf(outPath, sizeof(outPath), "%s/frame_%05d.png", path.outDir.c_str(), f);
+
+        if (std::filesystem::exists(outPath)) {
+            std::cout << "[AnimPath] frame " << (f + 1) << "/" << N << "  already exists — skipping\n"
+                      << std::flush;
+            ++saved;
+            continue;
+        }
+
+        float tSec = (float)f / (float)path.fps;
+        glm::vec3 pos, lookAt;
+        sEvalAnimPath(path, tSec, pos, lookAt);
+        glm::vec3 front = glm::normalize(lookAt - pos);
+
+        Camera cam;
+        cam.SetPose(pos, front);
+        cam.Zoom = path.fovDeg;
+
+        std::cout << "[AnimPath] frame " << (f + 1) << "/" << N
+                  << "  t=" << tSec << "s"
+                  << "  pos=(" << pos.x << ", " << pos.y << ", " << pos.z << ")\n"
+                  << std::flush;
+
+        auto ft0 = std::chrono::steady_clock::now();
+        bool ok  = renderFrame(cam, w, h, exposure, path.spp, outPath);
+        auto ft1 = std::chrono::steady_clock::now();
+        double frameSec = std::chrono::duration<double>(ft1 - ft0).count();
+
+        if (ok) {
+            ++saved;
+            ++renderedNow;
+            renderedSecs += frameSec;
+            double avgSec       = renderedSecs / renderedNow;
+            int    remaining    = N - (f + 1);
+            double etaSec       = avgSec * remaining;
+            std::cout << "  saved  —  " << frameSec << " s"
+                      << "  (avg " << avgSec << " s/frame, ETA "
+                      << (etaSec / 3600.0) << " h for " << remaining << " frames remaining)\n"
+                      << std::flush;
+        } else {
+            std::cerr << "[AnimPath] Write failed for frame " << f << "\n";
+        }
+    }
+
+    if (cancel) {
+        std::cout << "[AnimPath] Cancelled — " << saved << "/" << N
+                  << " frames saved to " << path.outDir << "/\n" << std::flush;
+    } else {
+        std::cout << "[AnimPath] Complete — " << saved << " frames saved to " << path.outDir << "/\n"
+                  << "\n"
+                  << "  Stitch to mp4 (" << path.fps << " fps, H.264):\n"
+                  << "  ffmpeg -framerate " << path.fps << " -i " << path.outDir << "/frame_%05d.png \\\n"
+                  << "         -c:v libx264 -pix_fmt yuv420p -crf 18 animation.mp4\n"
                   << std::flush;
     }
 }

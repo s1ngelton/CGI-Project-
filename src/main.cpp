@@ -7,6 +7,7 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "imgui_internal.h"   // ClearActiveID() — not exposed in the public header
 #endif
 
 #include "Camera.h"
@@ -33,6 +34,11 @@ constexpr int SCR_WIDTH  = 1920;
 constexpr int SCR_HEIGHT = 1080;
 const char*   TITLE      = "Horror Engine";
 
+// F-key AnimPath final render resolution — independent of the live window size
+// (the CPU ray tracer writes straight to PNG, never touches the GL window).
+int finalRenderWidth  = 6400;
+int finalRenderHeight = 2200;
+
 // ─── Global state ───────────────────────────────────────────────────────────
 Camera camera(glm::vec3(0.0f, 1.35f, 9.5f));
 float  lastX      = SCR_WIDTH  / 2.0f;
@@ -51,24 +57,25 @@ bool  cinematicMode    = false;   // true = play cinematic, false = free camera
 bool  uiMode           = false;   // Tab: unlock cursor so ImGui is clickable
 
 // Tonemap / HDR controls
-float globalExposure  = 1.0f;
+// ── SHIPPED LOOK — locked defaults, do not reset without saving these first ──
+float globalExposure  = 0.76f;
 int   globalTonemapOp = 0;        // 0 = ACES, 1 = Reinhard
 
 // Bloom controls
-bool  enableBloom      = false;
-float bloomThreshold   = 1.0f;
-float bloomKnee        = 0.5f;
-int   bloomIterations  = 5;
-float bloomIntensity   = 0.6f;
+bool  enableBloom      = true;
+float bloomThreshold   = 3.26f;
+float bloomKnee        = 0.42f;
+int   bloomIterations  = 2;
+float bloomIntensity   = 0.53f;
 
 // Color grade + vignette
-bool  gradeEnable      = false;
-float temperature      = 0.0f;
-float gradeTint[3]     = {1.0f, 1.0f, 1.0f};
-float saturation       = 1.0f;
-float shadowLift[3]    = {0.0f, 0.0f, 0.0f};
-float vignetteStrength = 0.0f;
-float vignetteSoftness = 0.45f;
+bool  gradeEnable      = true;
+float temperature      = -0.31f;
+float gradeTint[3]     = {241.0f/255.0f, 245.0f/255.0f, 255.0f/255.0f};
+float saturation       = 0.88f;
+float shadowLift[3]    = {5.0f/255.0f, 5.0f/255.0f, 15.0f/255.0f};
+float vignetteStrength = 1.00f;
+float vignetteSoftness = 0.00f;
 
 // Planar floor reflection
 bool  enableReflection  = false;
@@ -78,6 +85,20 @@ float glossyBlur        = 0.0f;
 // Cubemap reflection probe
 bool  enableProbe    = true;
 float probeStrength  = 1.0f;
+
+// Volumetric single-scattering (CPU ray tracer only). Stage 1: homogeneous glow.
+// Stage 2: shadow-ray light shafts. Stage 3: Henyey-Greenstein forward scattering (g).
+bool  enableVolumetrics          = true;
+float volumetricInteriorDensity  = 0.003f;
+float volumetricExteriorDensity  = 0.018f;  // void around the box — kept higher than interior
+float volumetricExtinction       = 0.04f;
+float volumetricStrength         = 0.54f;
+int   volumetricInteriorSteps    = 8;
+int   volumetricExteriorSteps    = 16;      // separately tunable — void span reaches maxDistance
+float volumetricG                = 0.70f;   // Henyey-Greenstein asymmetry; 0 = isotropic
+float volumetricExtVolCenter[3]  = {0.0f, 1.5f, 0.0f};  // exterior "atmosphere pocket" sphere
+float volumetricExtVolRadius     = 5.22f;               // tuned against the push-in shot — keep
+                                                          //   tight or a distant camera stops clipping
 
 // CPU ray tracer (offline)
 RayTracer   rayTracer;
@@ -90,12 +111,23 @@ GLuint g_rtProg = 0;
 GLuint g_rtVAO  = 0;
 bool   g_showRTNormals = false;
 
+// Fast low-res fog preview (P key) — quarter-ish resolution, 1 pass, no PNG write.
+// For iterating on exterior/interior volumetric density against real RT output without
+// paying full-res/full-AA cost; the raster preview can't show this at all (RT-only effect).
+constexpr int kFogPreviewW = 480;
+constexpr int kFogPreviewH = 270;
+RenderTask  g_fogTask;
+std::thread g_fogThread;
+GLuint      g_fogTex = 0;
+bool        g_showFogPreview = false;
+
 // Chair pose — live-adjust because free models have unpredictable scale/origin
 float chairPosX  =  0.3f;
 float chairPosY  =  0.0f;
 float chairPosZ  =  0.2f;
 float chairScale =  1.0f;
-float chairYaw   =  180.0f;  // default faces camera; dial with slider
+float chairYaw   =  150.0f;  // was 180 (faces camera) — turned partway toward the table
+float phoneYaw   =  200.0f;   // rotated so the dial face points at the pose-5 close-up camera
 
 // ─── CP4 step-1/2 unit test scaffolding ─────────────────────────────────────
 // Minimal box builder for isolated glass unit tests (--gpu-cp4-step1/-step2).
@@ -196,6 +228,13 @@ void scroll_callback(GLFWwindow*, double, double yoffset) {
 
 void key_callback(GLFWwindow* window, int key, int, int action, int) {
     if (action != GLFW_PRESS) return;
+#ifdef HAS_IMGUI
+    // ImGui's GLFW backend chains onto this callback (installed first, so ImGui wraps
+    // it), meaning every key we bind below would otherwise ALSO fire while a slider is
+    // in text-edit mode — e.g. pressing 'r' to type a value simultaneously toggles the
+    // RT render. Tab is exempt so it can always be used to leave UI mode.
+    if (key != GLFW_KEY_TAB && ImGui::GetIO().WantCaptureKeyboard) return;
+#endif
     switch (key) {
         case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(window, true); break;
         case GLFW_KEY_1:      enableShadows    = !enableShadows;    break;
@@ -226,6 +265,11 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
                     std::cerr << "[RT] Scene not built yet.\n";
                     break;
                 }
+                if (g_fogTask.active.load()) {
+                    std::cerr << "[RT] Fog preview is active — cancel it (P) first.\n";
+                    break;
+                }
+                g_showFogPreview     = false;  // mutually exclusive with the fog preview overlay
                 g_rtTask.cancel      = false;
                 g_rtTask.active      = true;
                 g_rtTask.samplesDone = 0;
@@ -233,6 +277,19 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
                 g_rtTask.bufDirty    = false;
                 rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
                                             bloomIterations, bloomIntensity});
+                rayTracer.setVolumetricSettings({enableVolumetrics,
+                                                 volumetricInteriorDensity, volumetricExteriorDensity,
+                                                 volumetricExtinction, volumetricStrength,
+                                                 volumetricInteriorSteps, volumetricExteriorSteps,
+                                                 20.0f, volumetricG,
+                                                 glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                           volumetricExtVolCenter[2]),
+                                                 volumetricExtVolRadius});
+                rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                                 glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                                 saturation,
+                                                 glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                                 vignetteStrength, vignetteSoftness, globalTonemapOp});
                 Camera capCam      = camera;
                 float  capExposure = globalExposure;
                 g_rtThread = std::thread([capCam, capExposure]() {
@@ -249,6 +306,77 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
                 g_showRTNormals = false;
                 glfwSetWindowTitle(window, TITLE);
             }
+            break;
+        }
+        // ── P: fast low-res volumetric-fog preview ────────────────────────────
+        // Quarter-ish resolution, single pass, no PNG write — for judging exterior/
+        // interior fog density against real RT output without full-res/full-AA cost.
+        // The raster preview can't show this at all since volumetrics are RT-only.
+        case GLFW_KEY_P: {
+            if (g_fogTask.active.load()) {
+                g_fogTask.cancel = true;
+                if (g_fogThread.joinable()) g_fogThread.join();
+                std::cout << "[FogPreview] Cancelled.\n";
+            } else if (!g_showFogPreview) {
+                if (!rayTracer.hasScene()) {
+                    std::cerr << "[FogPreview] Scene not built yet.\n";
+                    break;
+                }
+                if (g_rtTask.active.load()) {
+                    std::cerr << "[FogPreview] R render is active — cancel it (R) first.\n";
+                    break;
+                }
+                g_fogTask.cancel      = false;
+                g_fogTask.active      = true;
+                g_fogTask.samplesDone = 0;
+                g_fogTask.rowsDone    = 0;
+                g_fogTask.bufDirty    = false;
+                rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
+                                            bloomIterations, bloomIntensity});
+                rayTracer.setVolumetricSettings({enableVolumetrics,
+                                                 volumetricInteriorDensity, volumetricExteriorDensity,
+                                                 volumetricExtinction, volumetricStrength,
+                                                 volumetricInteriorSteps, volumetricExteriorSteps,
+                                                 20.0f, volumetricG,
+                                                 glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                           volumetricExtVolCenter[2]),
+                                                 volumetricExtVolRadius});
+                rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                                 glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                                 saturation,
+                                                 glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                                 vignetteStrength, vignetteSoftness, globalTonemapOp});
+                Camera capCam      = camera;
+                float  capExposure = globalExposure;
+                g_showRTNormals = false;  // mutually exclusive with the full-res RT overlay
+                g_fogThread = std::thread([capCam, capExposure]() {
+                    rayTracer.renderBeautyProgressive(
+                        capCam, kFogPreviewW, kFogPreviewH,
+                        capExposure, 1,      // 1 pass — fast, just for judging fog density
+                        g_fogTask,
+                        "");                  // no PNG write, preview only
+                });
+                g_showFogPreview = true;
+                std::cout << "[FogPreview] Started (" << kFogPreviewW << "x" << kFogPreviewH
+                          << ", 1 pass). P = hide.\n";
+            } else {
+                g_showFogPreview = false;
+            }
+            break;
+        }
+        // ── C: print current camera pose — fly to a pose, hit C, copy the numbers
+        // straight into a CameraKeyframe. lookAt is a suggested point 3m ahead along
+        // Front; adjust the depth by hand if the actual subject sits closer/farther.
+        case GLFW_KEY_C: {
+            glm::vec3 suggestedLookAt = camera.Position + camera.Front * 3.0f;
+            std::cout << "\n[Pose] pos    = {" << camera.Position.x << "f, "
+                      << camera.Position.y << "f, " << camera.Position.z << "f}\n"
+                      << "[Pose] front  = {" << camera.Front.x << "f, "
+                      << camera.Front.y << "f, " << camera.Front.z << "f}\n"
+                      << "[Pose] lookAt = {" << suggestedLookAt.x << "f, "
+                      << suggestedLookAt.y << "f, " << suggestedLookAt.z
+                      << "f}   (pos + front*3 — adjust depth as needed)\n"
+                      << std::flush;
             break;
         }
         // ── RT checkpoint renders (one pass each for quick validation) ────────
@@ -286,9 +414,9 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
             break;
         }
 
-        // ── F: offline animation render (push-in shot) ───────────────────────
-        // Renders AnimConfig::numFrames to frames/frame_XXXX.png, each at full SPP.
-        // Edit AnimConfig defaults in RayTracer.h to change the shot.
+        // ── F: offline animation render (multi-keyframe cinematic path) ───────
+        // Renders AnimPath's keyframes to frames/frame_XXXX.png, each at full SPP.
+        // Edit AnimPath's keyframes in RayTracer.h to change the shot.
         // R cancels mid-sequence (already-saved frames are kept).
         case GLFW_KEY_F: {
             if (g_rtTask.active.load()) {
@@ -304,11 +432,25 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
             g_showRTNormals = false;  // hide RT overlay — animation writes to disk only
             rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
                                         bloomIterations, bloomIntensity});
+            rayTracer.setVolumetricSettings({enableVolumetrics,
+                                             volumetricInteriorDensity, volumetricExteriorDensity,
+                                             volumetricExtinction, volumetricStrength,
+                                             volumetricInteriorSteps, volumetricExteriorSteps,
+                                             20.0f, volumetricG,
+                                             glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                       volumetricExtVolCenter[2]),
+                                             volumetricExtVolRadius});
+            rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                             glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                             saturation,
+                                             glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                             vignetteStrength, vignetteSoftness, globalTonemapOp});
             float capExposure = globalExposure;
-            // AnimConfig is baked into RayTracer.h — user edits and recompiles to change shot.
-            // To do a fast preview: set spp=1 and numFrames=5 in AnimConfig, recompile, press F.
+            // AnimPath's keyframes are baked into RayTracer.h — edit and recompile to
+            // change the shot. Renders at finalRenderWidth/Height (6400x2200 by default),
+            // independent of the live window size — the CPU path writes straight to PNG.
             g_rtThread = std::thread([capExposure]() {
-                rayTracer.renderAnimation(SCR_WIDTH, SCR_HEIGHT, capExposure, g_rtTask.cancel);
+                rayTracer.renderAnimationPath(finalRenderWidth, finalRenderHeight, capExposure, g_rtTask.cancel);
                 g_rtTask.active = false;
             });
             glfwSetWindowTitle(window, (std::string(TITLE) + " [Anim: rendering — R to cancel]").c_str());
@@ -320,7 +462,14 @@ void key_callback(GLFWwindow* window, int key, int, int action, int) {
             uiMode = !uiMode;
             glfwSetInputMode(window, GLFW_CURSOR,
                              uiMode ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
-            if (!uiMode) firstMouse = true;  // prevent camera jump on re-entry
+            if (!uiMode) {
+                firstMouse = true;  // prevent camera jump on re-entry
+#ifdef HAS_IMGUI
+                // Drop any lingering slider text-edit focus so leftover focus can't
+                // eat WASD/action keystrokes once we're back in gameplay.
+                ImGui::ClearActiveID();
+#endif
+            }
             break;
     }
 }
@@ -346,6 +495,8 @@ int main(int argc, char** argv) {
     bool temporalMode  = false;
     bool recordMode    = false;
     bool rtRecordMode  = false;
+    bool animPathPreviewMode = false;
+    bool animPathFinalMode   = false;
     bool gpuCP1Mode    = false;
     bool gpuCP2Mode    = false;
     bool gpuCP4Mode    = false;
@@ -363,6 +514,8 @@ int main(int argc, char** argv) {
         if (a == "--compare")  compareMode  = true;
         if (a == "--record")   recordMode   = true;
         if (a == "--rtrecord") rtRecordMode = true;
+        if (a == "--animpath-preview") animPathPreviewMode = true;
+        if (a == "--animpath-final")   animPathFinalMode   = true;
         if (a == "--gpu-cp1")  gpuCP1Mode   = true;
         if (a == "--gpu-cp2")  gpuCP2Mode   = true;
         if (a == "--gpu-cp4")  gpuCP4Mode   = true;
@@ -395,9 +548,10 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 #endif
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    if (compareMode || recordMode || rtRecordMode || gpuCP1Mode || gpuCP2Mode || gpuCP4Mode
-        || gpuCP5Mode || gpuAnimMode || gpuCP4Step1 || gpuCP4Step2 || gpuCP4Step25 || gpuCP4Step35
-        || gpuCP4PixelDiag || gpuCP4StackTrace)
+    if (compareMode || recordMode || rtRecordMode || animPathPreviewMode || animPathFinalMode
+        || gpuCP1Mode || gpuCP2Mode
+        || gpuCP4Mode || gpuCP5Mode || gpuAnimMode || gpuCP4Step1 || gpuCP4Step2 || gpuCP4Step25
+        || gpuCP4Step35 || gpuCP4PixelDiag || gpuCP4StackTrace)
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // headless: context only, no window
 
     GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, TITLE, nullptr, nullptr);
@@ -436,6 +590,19 @@ int main(int argc, char** argv) {
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // ── Fast fog preview setup (P key) — small texture, linear-filtered since
+    // it's stretched to fill the screen from a much lower native resolution ────
+    glGenTextures(1, &g_fogTex);
+    glBindTexture(GL_TEXTURE_2D, g_fogTex);
+    {
+        std::vector<uint8_t> black(kFogPreviewW * kFogPreviewH * 3, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, kFogPreviewW, kFogPreviewH,
+                     0, GL_RGB, GL_UNSIGNED_BYTE, black.data());
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     // "Control" room camera — 35 mm lens, straight-on, centered
@@ -875,8 +1042,98 @@ int main(int argc, char** argv) {
                   << "h  |  model floor at Y=" << mn.y << "\n";
     }
 
+    // Bake the initial chairPos/chairYaw/chairScale pose in BEFORE buildScene() runs —
+    // otherwise the CPU ray tracer's BVH captures the chair at SceneObject's default
+    // identity transform (no offset, no rotation) while the raster loop applies the
+    // live T*R*S every frame, which is exactly what made R's render show the chair
+    // in the wrong orientation relative to the raster preview.
+    {
+        glm::mat4 T = glm::translate(glm::mat4(1.0f), glm::vec3(chairPosX, chairPosY, chairPosZ));
+        glm::mat4 R = glm::rotate(glm::mat4(1.0f), glm::radians(chairYaw), glm::vec3(0.0f, 1.0f, 0.0f));
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), glm::vec3(chairScale));
+        chairObj.transform = T * R * S;
+    }
+
     scene.objects.push_back(std::move(chairObj));
     const int kChairIdx = (int)scene.objects.size() - 1;
+
+    // ── Coffee table prop, to the right of the chair ─────────────────────────
+    // Has a proper .mtl (map_Kd + map_Bump) next to it, so Model::load picks up
+    // the diffuse/normal textures automatically — no manual loadPBRMaps needed.
+    SceneObject tableObj;
+    const std::string kTableDir = "assets/models/Textures/4K - Woodbang Touchey coffee table - oak/";
+    tableObj.model.load(kTableDir + "4K - Woodbang Touchey coffee table - oak.obj");
+    // GPU texture (above) is unreadable from the CPU ray tracer — same as the floor.
+    tableObj.model.loadCPUAlbedo(kTableDir + "4K Oak Wood.jpg");
+
+    glm::vec3 tableLocalCenter;
+    float     tableLocalTopY;
+    {
+        auto [mn, mx] = tableObj.model.computeAABB();
+        glm::vec3 sz  = mx - mn;
+        tableLocalCenter = glm::vec3((mn.x + mx.x) * 0.5f, mn.y, (mn.z + mx.z) * 0.5f);
+        tableLocalTopY   = mx.y;
+        std::cout << "[Table AABB]  min(" << mn.x << ", " << mn.y << ", " << mn.z << ")"
+                  << "  max(" << mx.x << ", " << mx.y << ", " << mx.z << ")\n"
+                  << "[Table AABB]  " << sz.x << "w × " << sz.z << "d × " << sz.y
+                  << "h  |  model floor at Y=" << mn.y << "\n";
+    }
+
+    // Model is authored in centimetres with an off-center local origin — scale
+    // to metres and fold the footprint center into the translation so this
+    // position is where the table actually ends up, not its raw local origin.
+    const float     kTableScale = 0.0125f;              // ~25% bigger than before
+    const glm::vec3 kTablePos   = {1.4f, 0.0f, 0.3f};   // world position, to the chair's +X (right)
+    glm::mat4 tT = glm::translate(glm::mat4(1.0f), kTablePos - kTableScale * tableLocalCenter);
+    glm::mat4 tS = glm::scale(glm::mat4(1.0f), glm::vec3(kTableScale));
+    tableObj.transform = tT * tS;
+    const float kTableTopWorldY = kTablePos.y + kTableScale * (tableLocalTopY - tableLocalCenter.y);
+
+    scene.objects.push_back(std::move(tableObj));
+
+    // ── Phone prop, sitting on the table ──────────────────────────────────────
+    // The .mtl has no real authored colours — its "wire_228184153"-style names
+    // are auto-generated per-part placeholders from the 3ds Max OBJ export (the
+    // digits are literally the RGB values, e.g. wire_228184153 = 228,184,153),
+    // which is why it renders as a rainbow of unrelated parts. Override with a
+    // single uniform red, same fallback pattern as the chair's setAlbedoColor.
+    SceneObject phoneObj;
+    phoneObj.model.load("assets/models/Textures/phone.obj");
+    phoneObj.model.setAlbedoColor(glm::vec3(0.55f, 0.05f, 0.04f));
+
+    glm::vec3 phoneLocalCenter;
+    {
+        auto [mn, mx] = phoneObj.model.computeAABB();
+        glm::vec3 sz  = mx - mn;
+        phoneLocalCenter = glm::vec3((mn.x + mx.x) * 0.5f, mn.y, (mn.z + mx.z) * 0.5f);
+        std::cout << "[Phone AABB]  min(" << mn.x << ", " << mn.y << ", " << mn.z << ")"
+                  << "  max(" << mx.x << ", " << mx.y << ", " << mx.z << ")\n"
+                  << "[Phone AABB]  " << sz.x << "w × " << sz.z << "d × " << sz.y
+                  << "h  |  model floor at Y=" << mn.y << "\n";
+    }
+
+    const float     kPhoneScale = 0.01f;   // centimetres -> metres, same convention as the table
+    const glm::vec3 kPhonePos   = {kTablePos.x, kTableTopWorldY, kTablePos.z};   // centred on the tabletop
+    // Rotate about the phone's own local centre (not the world origin) so it spins in
+    // place at its table position, same pivot convention as the chair's T*R*S.
+    glm::mat4 pT  = glm::translate(glm::mat4(1.0f), kPhonePos);
+    glm::mat4 pR  = glm::rotate(glm::mat4(1.0f), glm::radians(phoneYaw), glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 pS  = glm::scale(glm::mat4(1.0f), glm::vec3(kPhoneScale));
+    glm::mat4 pTc = glm::translate(glm::mat4(1.0f), -phoneLocalCenter);
+    phoneObj.transform = pT * pR * pS * pTc;
+
+    // World-space geometric centre (true AABB centre, not the floor-contact point
+    // kPhonePos is) — use this for anything that should look dead-on at the phone,
+    // e.g. a close-up shot's look-at target.
+    {
+        auto [mn, mx] = phoneObj.model.computeAABB();
+        glm::vec3 localCenter = (mn + mx) * 0.5f;
+        glm::vec3 worldCenter = glm::vec3(phoneObj.transform * glm::vec4(localCenter, 1.0f));
+        std::cout << "[Phone World Center]  (" << worldCenter.x << ", "
+                  << worldCenter.y << ", " << worldCenter.z << ")\n";
+    }
+
+    scene.objects.push_back(std::move(phoneObj));
 
     // Build BVH over the complete scene (opaque + glass objects)
     rayTracer.buildScene(scene);
@@ -1351,6 +1608,11 @@ int main(int argc, char** argv) {
 
         rayTracer.setOIDNSettings({true});
         rayTracer.setBloomSettings({true, bloomThreshold, bloomKnee, bloomIterations, bloomIntensity});
+        rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                         glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                         saturation,
+                                         glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                         vignetteStrength, vignetteSoftness, globalTonemapOp});
 
         for (const auto& tc : testCams) {
             Camera cam(tc.pos);
@@ -1426,6 +1688,11 @@ int main(int argc, char** argv) {
         rayTracer.setOIDNSettings({true});
         rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
                                     bloomIterations, bloomIntensity});
+        rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                         glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                         saturation,
+                                         glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                         vignetteStrength, vignetteSoftness, globalTonemapOp});
 
         // Mirrors AnimConfig defaults from RayTracer.h.
         const glm::vec3 kStart  = {0.0f, 1.55f, 6.5f};
@@ -1479,7 +1746,6 @@ int main(int argc, char** argv) {
 
     // ── Compare mode: 3 timed renders, then exit ───────────────────────────
     if (compareMode) {
-        // Animation end-frame camera: closest approach to the chair — worst case for detail.
         glm::vec3 cPos    = glm::vec3(0.3f, 1.15f, 2.8f);
         glm::vec3 cLookAt = glm::vec3(0.3f, 0.65f, 0.2f);
         Camera testCam(cPos);
@@ -1500,6 +1766,19 @@ int main(int argc, char** argv) {
             rayTracer.setOIDNSettings({r.oidn});
             rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
                                         bloomIterations, bloomIntensity});
+            rayTracer.setVolumetricSettings({enableVolumetrics,
+                                              volumetricInteriorDensity, volumetricExteriorDensity,
+                                              volumetricExtinction, volumetricStrength,
+                                              volumetricInteriorSteps, volumetricExteriorSteps,
+                                              20.0f, volumetricG,
+                                              glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                        volumetricExtVolCenter[2]),
+                                              volumetricExtVolRadius});
+            rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                             glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                             saturation,
+                                             glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                             vignetteStrength, vignetteSoftness, globalTonemapOp});
             std::cout << "--- " << r.path
                       << "  (" << r.spp << " spp, OIDN=" << (r.oidn ? "ON" : "off") << ") ---\n";
             auto t0 = std::chrono::steady_clock::now();
@@ -1529,6 +1808,11 @@ int main(int argc, char** argv) {
         rayTracer.setOIDNSettings({true});
         rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
                                     bloomIterations, bloomIntensity});
+        rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                         glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                         saturation,
+                                         glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                         vignetteStrength, vignetteSoftness, globalTonemapOp});
 
         std::filesystem::create_directories("temporal");
 
@@ -1653,6 +1937,83 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ── AnimPath low-res/low-spp preview: watch choreography + pacing before
+    // committing the full-res final render ──────────────────────────────────
+    if (animPathPreviewMode) {
+        rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
+                                    bloomIterations, bloomIntensity});
+        rayTracer.setVolumetricSettings({enableVolumetrics,
+                                         volumetricInteriorDensity, volumetricExteriorDensity,
+                                         volumetricExtinction, volumetricStrength,
+                                         volumetricInteriorSteps, volumetricExteriorSteps,
+                                         20.0f, volumetricG,
+                                         glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                   volumetricExtVolCenter[2]),
+                                         volumetricExtVolRadius});
+        rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                         glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                         saturation,
+                                         glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                         vignetteStrength, vignetteSoftness, globalTonemapOp});
+
+        AnimPath previewPath;   // default-constructed = real keyframes + final pacing/fps
+        previewPath.spp    = 2;    // keep this fast — final quality is the 6400x2200/F-key path
+        previewPath.outDir = "frames_preview";
+        rayTracer.setAnimPath(previewPath);
+
+        std::atomic<bool> cancel{false};
+        rayTracer.renderAnimationPath(1280, 720, globalExposure, cancel);
+
+        std::cout << "\nStitching preview video...\n";
+        std::string stitchCmd = "ffmpeg -framerate " + std::to_string(previewPath.fps) +
+                                 " -i frames_preview/frame_%05d.png "
+                                 "-c:v libx264 -pix_fmt yuv420p -crf 23 -preset fast "
+                                 "animpath_preview.mp4 -y 2>&1";
+        std::system(stitchCmd.c_str());
+        std::cout << "Done → animpath_preview.mp4\n";
+        glfwTerminate();
+        return 0;
+    }
+
+    // ── AnimPath FINAL render: 6400x2200, 8spp, OIDN+bloom+volumetrics+locked
+    // grade, real 5-keyframe path at 24fps/50s (1200 frames). Headless/unattended
+    // — safe to Ctrl+C and resume (renderAnimationPath skips existing frames).
+    if (animPathFinalMode) {
+        rayTracer.setOIDNSettings({true});
+        rayTracer.setBloomSettings({enableBloom, bloomThreshold, bloomKnee,
+                                    bloomIterations, bloomIntensity});
+        rayTracer.setVolumetricSettings({enableVolumetrics,
+                                         volumetricInteriorDensity, volumetricExteriorDensity,
+                                         volumetricExtinction, volumetricStrength,
+                                         volumetricInteriorSteps, volumetricExteriorSteps,
+                                         20.0f, volumetricG,
+                                         glm::vec3(volumetricExtVolCenter[0], volumetricExtVolCenter[1],
+                                                   volumetricExtVolCenter[2]),
+                                         volumetricExtVolRadius});
+        rayTracer.setColorGradeSettings({gradeEnable, temperature,
+                                         glm::vec3(gradeTint[0], gradeTint[1], gradeTint[2]),
+                                         saturation,
+                                         glm::vec3(shadowLift[0], shadowLift[1], shadowLift[2]),
+                                         vignetteStrength, vignetteSoftness, globalTonemapOp});
+
+        AnimPath finalPath;   // default-constructed = shipped keyframes, 24fps, 8spp, 50s total
+        rayTracer.setAnimPath(finalPath);
+
+        std::cout << "\n=== FINAL RENDER: " << finalRenderWidth << "x" << finalRenderHeight
+                  << ", " << finalPath.spp << " spp ===\n"
+                  << "No interactive cancel here (headless) — Ctrl+C stops it; already-saved\n"
+                  << "frames stay on disk and re-running this command resumes automatically.\n";
+
+        std::atomic<bool> cancel{false};
+        rayTracer.renderAnimationPath(finalRenderWidth, finalRenderHeight, globalExposure, cancel);
+
+        std::cout << "\nStitch when ready:\n"
+                  << "  ffmpeg -framerate " << finalPath.fps << " -i " << finalPath.outDir
+                  << "/frame_%05d.png -c:v libx264 -pix_fmt yuv420p -crf 18 animation_final.mp4\n";
+        glfwTerminate();
+        return 0;
+    }
+
     // ── Render loop ────────────────────────────────────────────────────────
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = static_cast<float>(glfwGetTime());
@@ -1736,6 +2097,22 @@ int main(int argc, char** argv) {
             glfwSetWindowTitle(window, (std::string(TITLE) + suffix).c_str());
         }
 
+        // ── Fog preview: upload new pixels whenever the render thread signals ──
+        if (g_fogTask.bufDirty.exchange(false)) {
+            {
+                std::lock_guard<std::mutex> lk(g_fogTask.bufMutex);
+                if (!g_fogTask.buf.empty() && g_fogTex) {
+                    glBindTexture(GL_TEXTURE_2D, g_fogTex);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                                    kFogPreviewW, kFogPreviewH,
+                                    GL_RGB, GL_UNSIGNED_BYTE, g_fogTask.buf.data());
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                }
+            }
+            if (!g_fogTask.active.load())
+                glfwSetWindowTitle(window, (std::string(TITLE) + " [FogPreview done — P to hide]").c_str());
+        }
+
         // ── RT overlay: overdraws raster when active ──────────────────────
         // Reset every piece of GL state the renderer's glass/blend passes may
         // leave enabled — if any of these are on, the overlay either disappears
@@ -1752,6 +2129,27 @@ int main(int argc, char** argv) {
             glUseProgram(g_rtProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_rtTex);
+            glUniform1i(glGetUniformLocation(g_rtProg, "uTex"), 0);
+            glBindVertexArray(g_rtVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glDepthMask(GL_TRUE);
+        }
+
+        // ── Fog preview overlay: same quad shader, smaller linear-filtered texture ──
+        if (g_showFogPreview && g_fogTex) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_BLEND);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_STENCIL_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDepthMask(GL_FALSE);
+            glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+            glUseProgram(g_rtProg);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_fogTex);
             glUniform1i(glGetUniformLocation(g_rtProg, "uTex"), 0);
             glBindVertexArray(g_rtVAO);
             glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1789,6 +2187,17 @@ int main(int argc, char** argv) {
         ImGui::SliderFloat("Bloom knee",        &bloomKnee,       0.0f, 0.5f, "%.2f");
         ImGui::SliderInt  ("Bloom iterations",  &bloomIterations, 1,    10);
         ImGui::SliderFloat("Bloom intensity",   &bloomIntensity,  0.0f, 1.0f, "%.2f");
+        ImGui::Separator();
+        ImGui::Checkbox("Volumetrics (RT only)", &enableVolumetrics);
+        ImGui::SliderFloat("Interior density",  &volumetricInteriorDensity, 0.0f, 1.0f,  "%.3f");
+        ImGui::SliderFloat("Exterior density",  &volumetricExteriorDensity, 0.0f, 1.0f,  "%.3f");
+        ImGui::SliderFloat("Volumetric extinction", &volumetricExtinction, 0.0f, 1.0f,  "%.2f");
+        ImGui::SliderFloat("Volumetric strength",   &volumetricStrength,   0.0f, 5.0f,  "%.2f");
+        ImGui::SliderInt  ("Interior steps",    &volumetricInteriorSteps,   1,    128);
+        ImGui::SliderInt  ("Exterior steps",    &volumetricExteriorSteps,   1,    128);
+        ImGui::SliderFloat("Volumetric g (HG phase)", &volumetricG,        -0.95f, 0.95f, "%.2f");
+        ImGui::SliderFloat3("Ext. pocket centre", volumetricExtVolCenter, -5.0f, 5.0f, "%.2f");
+        ImGui::SliderFloat ("Ext. pocket radius",  &volumetricExtVolRadius, 1.0f, 15.0f, "%.2f");
         ImGui::Separator();
         ImGui::Checkbox("Color grade",          &gradeEnable);
         ImGui::SliderFloat("Temperature",       &temperature,      -1.0f, 1.0f, "%.2f");
@@ -1837,11 +2246,14 @@ int main(int argc, char** argv) {
     }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
-    // Stop render thread before destroying GL resources it might be uploading to
+    // Stop render threads before destroying GL resources they might be uploading to
     g_rtTask.cancel = true;
     if (g_rtThread.joinable()) g_rtThread.join();
+    g_fogTask.cancel = true;
+    if (g_fogThread.joinable()) g_fogThread.join();
 
     glDeleteTextures(1,      &g_rtTex);
+    glDeleteTextures(1,      &g_fogTex);
     glDeleteProgram(g_rtProg);
     glDeleteVertexArrays(1,  &g_rtVAO);
 #ifdef HAS_IMGUI
